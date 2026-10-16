@@ -10,6 +10,7 @@ import java.io.StringReader;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -50,6 +51,15 @@ public class M3uParser {
     public static final String HEADER_REFERER = "Referer";
 
     public static List<ChannelGroup> parse(String content) {
+        return parse(content, null);
+    }
+
+    /**
+     * @param keepGroups groups to narrow the playlist to, or null/empty to keep every group.
+     *                   A playlist that contains none of them is kept whole: narrowing is a
+     *                   favour to the remote control, never a way to end up with nothing.
+     */
+    public static List<ChannelGroup> parse(String content, Collection<String> keepGroups) {
         Map<String, ChannelGroup> groupMap = new LinkedHashMap<>();
 
         if (content == null || content.trim().isEmpty()) {
@@ -61,8 +71,171 @@ public class M3uParser {
         } else {
             parseTxt(content, groupMap);
         }
+        dropNonChannels(groupMap);
+        mergeDuplicates(groupMap);
+        narrowToGroups(groupMap, keepGroups);
 
         return new ArrayList<>(groupMap.values());
+    }
+
+    /**
+     * Removes entries that are not channels.
+     *
+     * <p>Public playlists carry bookkeeping lines alongside the stations. CCSH's lists a progress
+     * timestamp as an entry - {@code tvg-name="20261016 06:45"} pointing at a test clip - because
+     * the generator writes its state into the same file. It parses like any other entry, so it
+     * arrives in the channel list as a channel whose name is a date, and because the generator
+     * writes it first, it is the one the app opens on a fresh start.
+     *
+     * <p>A name that is a timestamp, or nothing but punctuation, is not something a viewer could
+     * be looking for. The test clip behind it is not the only stream a playlist carries that is
+     * not television, so this rejects by shape rather than by the one name seen in the wild.
+     */
+    private static void dropNonChannels(Map<String, ChannelGroup> groupMap) {
+        int dropped = 0;
+        List<String> emptied = new ArrayList<>();
+        for (Map.Entry<String, ChannelGroup> entry : groupMap.entrySet()) {
+            ChannelGroup group = entry.getValue();
+            if (group.channels == null || group.channels.isEmpty()) {
+                continue;
+            }
+            List<Channel> kept = new ArrayList<>(group.channels.size());
+            for (Channel channel : group.channels) {
+                if (looksLikeChannel(channel)) {
+                    kept.add(channel);
+                } else {
+                    dropped++;
+                }
+            }
+            group.channels = kept;
+            if (kept.isEmpty()) {
+                // A group that held nothing but bookkeeping has no reason to appear in the menu.
+                emptied.add(entry.getKey());
+            }
+        }
+        for (String name : emptied) {
+            groupMap.remove(name);
+        }
+        if (dropped > 0) {
+            Log.i(TAG, "Dropped " + dropped + " non-channel entries");
+        }
+    }
+
+    private static boolean looksLikeChannel(Channel channel) {
+        if (channel == null || isEmpty(channel.name)) {
+            return false;
+        }
+        String name = channel.name.trim();
+        if (TIMESTAMP_PATTERN.matcher(name).matches()) {
+            return false;
+        }
+        // A name with no letter and no ideograph is punctuation or digits: not a station name.
+        boolean hasLetter = false;
+        for (int i = 0; i < name.length(); i++) {
+            if (Character.isLetter(name.charAt(i))) {
+                hasLetter = true;
+                break;
+            }
+        }
+        return hasLetter;
+    }
+
+    /** A date, optionally with a time: the shape playlist generators use for their own state. */
+    private static final Pattern TIMESTAMP_PATTERN = Pattern.compile(
+            "\\d{4}[-/]?\\d{2}[-/]?\\d{2}([ T]\\d{2}:\\d{2}(:\\d{2})?)?");
+
+    /**
+     * Collapses entries that name the same channel within a group into one entry carrying every
+     * source. Public playlists list each channel once per source, so without this a 38-channel
+     * CCTV lineup arrives as 455 separate channels of one source each: unreadable on a remote,
+     * and - because each one has only a single URL - with nothing to fail over to. Every source
+     * is kept, in playlist order, so playback can walk them until one plays.
+     *
+     * Groups are never merged: two channels of the same name in two groups are two channels.
+     */
+    private static void mergeDuplicates(Map<String, ChannelGroup> groupMap) {
+        for (ChannelGroup group : groupMap.values()) {
+            if (group.channels == null || group.channels.size() < 2) {
+                continue;
+            }
+            Map<String, Channel> byName = new LinkedHashMap<>();
+            List<Channel> merged = new ArrayList<>();
+            for (Channel candidate : group.channels) {
+                String key = candidate.name == null ? "" : candidate.name.trim();
+                Channel target = byName.get(key);
+                if (target == null) {
+                    byName.put(key, candidate);
+                    merged.add(candidate);
+                } else {
+                    mergeInto(target, candidate);
+                }
+            }
+            if (merged.size() != group.channels.size()) {
+                Log.d(TAG, "Merged " + group.channels.size() + " entries into " + merged.size()
+                        + " channels in " + group.name);
+            }
+            group.channels = merged;
+        }
+    }
+
+    /**
+     * Folds {@code other} into {@code target}. The first entry stays the one on show, so its
+     * name, logo and EPG id win; the later copies only contribute what the first one lacks, so
+     * a duplicate can fill in a missing logo or catchup template without overwriting a good one.
+     */
+    private static void mergeInto(Channel target, Channel other) {
+        for (String url : other.urls) {
+            target.addUrl(url);
+        }
+        if (isEmpty(target.logo)) {
+            target.logo = other.logo;
+        }
+        if (isEmpty(target.tvgId)) {
+            target.tvgId = other.tvgId;
+        }
+        if (isEmpty(target.catchupType)) {
+            target.catchupType = other.catchupType;
+        }
+        if (isEmpty(target.catchupSource)) {
+            target.catchupSource = other.catchupSource;
+        }
+        if (isEmpty(target.catchupReplace)) {
+            target.catchupReplace = other.catchupReplace;
+        }
+        if (other.headers != null) {
+            if (target.headers == null) {
+                target.headers = other.headers;
+            } else {
+                for (Map.Entry<String, String> entry : other.headers.entrySet()) {
+                    if (!target.headers.containsKey(entry.getKey())) {
+                        target.headers.put(entry.getKey(), entry.getValue());
+                    }
+                }
+            }
+        }
+    }
+
+    /** Drops every group outside {@code keepGroups}, unless the playlist has none of them. */
+    private static void narrowToGroups(Map<String, ChannelGroup> groupMap, Collection<String> keepGroups) {
+        if (keepGroups == null || keepGroups.isEmpty()) {
+            return;
+        }
+        List<String> present = new ArrayList<>();
+        for (String name : keepGroups) {
+            ChannelGroup group = groupMap.get(name);
+            if (group != null && group.channels != null && !group.channels.isEmpty()) {
+                present.add(name);
+            }
+        }
+        if (present.isEmpty()) {
+            Log.w(TAG, "None of the requested groups are present; keeping every group");
+            return;
+        }
+        groupMap.keySet().retainAll(present);
+    }
+
+    private static boolean isEmpty(String value) {
+        return value == null || value.isEmpty();
     }
 
     /**

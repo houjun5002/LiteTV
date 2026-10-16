@@ -63,6 +63,8 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
     protected String currentPlayPath;
     protected Map<String, String> currentHeaders;
     private boolean mRetriedAsHls;
+    /** 0 for no cap; otherwise the tallest rendition the track selector may pick. */
+    private int mMaxVideoHeight;
 
     public ExoMediaPlayer(Context context) {
         mAppContext = context.getApplicationContext();
@@ -147,10 +149,17 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
         VideoViewConfig config = VideoViewManager.getConfig();
         if (mTrackSelector instanceof DefaultTrackSelector) {
             DefaultTrackSelector trackSelector = (DefaultTrackSelector) mTrackSelector;
-            DefaultTrackSelector.Parameters.Builder parameters = trackSelector.buildUponParameters()
-                    // Playlists often carry several renditions of one channel; take the best one
-                    // instead of adapting down to the first that fits.
-                    .setForceHighestSupportedBitrate(true);
+            DefaultTrackSelector.Parameters.Builder parameters = trackSelector.buildUponParameters();
+            if (mMaxVideoHeight > 0) {
+                // The viewer asked for a ceiling, so stop at the best rendition under it.
+                // Asking for the highest bitrate at the same time would contradict the cap.
+                // Width is unconstrained: a 4:3 picture has to stay 4:3.
+                parameters.setMaxVideoSize(Integer.MAX_VALUE, mMaxVideoHeight);
+            } else {
+                // Playlists often carry several renditions of one channel; take the best one
+                // instead of adapting down to the first that fits.
+                parameters.setForceHighestSupportedBitrate(true);
+            }
             if (config.mTunnelingEnabled) {
                 parameters.setTunnelingEnabled(true);
             }
@@ -353,6 +362,21 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
     }
 
     @Override
+    public long getBufferedPosition() {
+        return mInternalPlayer == null ? 0 : mInternalPlayer.getBufferedPosition();
+    }
+
+    @Override
+    public void setMaxVideoHeight(int height) {
+        mMaxVideoHeight = height;
+        // Applied at once so the change is visible on the stream that is already playing; the
+        // stored value is picked up again by the next player, and on the next channel.
+        if (mInternalPlayer != null) {
+            applyOutputPreferences();
+        }
+    }
+
+    @Override
     public void setSurface(Surface surface) {
         if (mInternalPlayer != null) {
             mInternalPlayer.setVideoSurface(surface);
@@ -438,8 +462,40 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
             return;
         }
         if (mPlayerEventListener != null) {
-            mPlayerEventListener.onError();
+            // Some public sources answer with a DRM or anti-piracy notice instead of the stream:
+            // a short clip, a still frame telling the viewer they are "a victim of piracy" and to
+            // contact a Telegram account. It plays perfectly and is not an error at all, so no
+            // amount of retrying or format-switching gets past it - only moving to the next
+            // source does. Flagging it lets the caller skip rather than reconnect forever.
+            mPlayerEventListener.onError(isBlockedByNotice(error)
+                    ? PlayerEventListener.PLAYER_ERROR_BLOCKED
+                    : PlayerEventListener.PLAYER_ERROR_UNKNOWN);
         }
+    }
+
+    /**
+     * True when a failure looks like a rejected or substituted stream rather than a broken one.
+     *
+     * <p>A DRM-protected stream cannot be played by any player that has no licence for it, and
+     * counting it as a transport failure would make the app reconnect to it five times over.
+     */
+    private boolean isBlockedByNotice(PlaybackException error) {
+        int code = error.errorCode;
+        if (code == PlaybackException.ERROR_CODE_DRM_LICENSE_ACQUISITION_FAILED
+                || code == PlaybackException.ERROR_CODE_DRM_LICENSE_EXPIRED
+                || code == PlaybackException.ERROR_CODE_DRM_DISALLOWED_OPERATION
+                || code == PlaybackException.ERROR_CODE_DRM_SCHEME_UNSUPPORTED
+                || code == PlaybackException.ERROR_CODE_DRM_SYSTEM_ERROR
+                || code == PlaybackException.ERROR_CODE_DRM_PROVISIONING_FAILED
+                || code == PlaybackException.ERROR_CODE_DRM_CONTENT_ERROR
+                || code == PlaybackException.ERROR_CODE_DRM_UNSPECIFIED) {
+            return true;
+        }
+        // A substituted notice is not marked as any of those; it is served as ordinary content
+        // whose only failing is that it is far too short to be a live channel. Callers treat the
+        // "played to the end almost immediately" case as the same signal.
+        return code == PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED
+                && currentPlayPath != null && currentPlayPath.startsWith("rtsp");
     }
 
     private boolean retryAsHls(PlaybackException error) {

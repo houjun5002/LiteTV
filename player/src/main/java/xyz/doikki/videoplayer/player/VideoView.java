@@ -91,6 +91,8 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
     public static final int STATE_BUFFERED = 7;
     public static final int STATE_START_ABORT = 8;//开始播放中止
     protected int mCurrentPlayState = STATE_IDLE;//当前播放器的状态
+    /** Why the last playback failed; see PlayerEventListener's PLAYER_ERROR_* constants. */
+    protected int mLastErrorReason = AbstractPlayer.PlayerEventListener.PLAYER_ERROR_UNKNOWN;
 
     public static final int PLAYER_NORMAL = 10;        // 普通播放器
     public static final int PLAYER_FULL_SCREEN = 11;   // 全屏播放器
@@ -295,6 +297,9 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
             setOptions();
         }
         if (prepareDataSource()) {
+            // A fresh attempt, so the previous failure's reason does not carry over and make the
+            // caller skip a source that was never tried.
+            mLastErrorReason = AbstractPlayer.PlayerEventListener.PLAYER_ERROR_UNKNOWN;
             mMediaPlayer.prepareAsync();
             setPlayState(STATE_PREPARING);
             setPlayerState(isFullScreen() ? PLAYER_FULL_SCREEN : isTinyScreen() ? PLAYER_TINY_SCREEN : PLAYER_NORMAL);
@@ -547,6 +552,22 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
     }
 
     /**
+     * 获取已缓冲到的位置（毫秒）。直播能否回退取决于它。
+     */
+    public long getBufferedPosition() {
+        return mMediaPlayer != null ? mMediaPlayer.getBufferedPosition() : 0;
+    }
+
+    /**
+     * 限制视频高度（清晰度）。传 0 表示不限制。
+     */
+    public void setMaxVideoHeight(int height) {
+        if (mMediaPlayer != null) {
+            mMediaPlayer.setMaxVideoHeight(height);
+        }
+    }
+
+    /**
      * 设置静音
      */
     @Override
@@ -607,7 +628,17 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      */
     @Override
     public void onError() {
+        onError(AbstractPlayer.PlayerEventListener.PLAYER_ERROR_UNKNOWN);
+    }
+
+    /**
+     * 视频播放出错回调（带原因）。{@link PlayerEventListener#PLAYER_ERROR_BLOCKED} 表示这条线路
+     * 是被 DRM 或防盗版提示挡下的，重连和换格式都没有用，只能换线路。
+     */
+    @Override
+    public void onError(int reason) {
         mPlayerContainer.setKeepScreenOn(false);
+        mLastErrorReason = reason;
         setPlayState(STATE_ERROR);
     }
 
@@ -637,6 +668,14 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      */
     public int getCurrentPlayState() {
         return mCurrentPlayState;
+    }
+
+    /**
+     * 上一次播放失败的原因。{@link PlayerEventListener#PLAYER_ERROR_BLOCKED} 表示这条线路是被
+     * DRM 或防盗版提示挡下的，重连没有意义。每次开始播放时会重置。
+     */
+    public int getLastErrorReason() {
+        return mLastErrorReason;
     }
 
     /**

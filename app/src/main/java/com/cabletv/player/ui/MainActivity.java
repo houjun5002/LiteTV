@@ -21,7 +21,12 @@ import com.cabletv.player.config.AppConfig;
 import com.cabletv.player.config.ChannelNavigator;
 import com.cabletv.player.config.ChannelRepository;
 import com.cabletv.player.config.KeyMapping;
+import com.cabletv.player.config.SourceSpeedStore;
+import com.cabletv.player.config.SourceSpeedTester;
+import com.cabletv.player.config.VideoQuality;
 import com.cabletv.player.model.Channel;
+
+import java.util.ArrayList;
 import com.cabletv.player.epg.EpgManager;
 import com.cabletv.player.server.ConfigWebServer;
 import com.cabletv.player.util.CatchupUrlBuilder;
@@ -40,7 +45,18 @@ public class MainActivity extends Activity {
     private PlaybackStatusView mPlaybackStatusView;
     private ChannelNumberView mChannelNumberView;
     private TimeShiftBarComponent mTimeShiftBar;
+    private LoadingOverlay mLoadingOverlay;
+    /**
+     * True while a playlist download is in progress. The load listener fires more than once -
+     * once for the cached copy and again for the refresh - so the cover is dropped on the first
+     * result that is worth watching rather than on the first callback.
+     */
+    private boolean mAwaitingChannels = true;
     private GestureDetector mGestureDetector;
+    /** Rewinding within what the player already holds, for channels with no server-side replay. */
+    private boolean mLocalShiftActive;
+    /** Where in the stream's own timeline the local shift is parked. */
+    private long mShiftTargetMs;
     private final Runnable mTimeShiftTicker = this::tickTimeShiftBar;
     /** How far back the live time-shift bar may rewind when no EPG is known. */
     private static final long TIMESHIFT_NO_EPG_WINDOW_MS = 2 * 60 * 60 * 1000L;
@@ -69,6 +85,16 @@ public class MainActivity extends Activity {
     private int mReconnectAttempt = 0;
     /** Which of the current channel's URLs is playing; the rest are fallbacks. */
     private int mCurrentUrlIndex = 0;
+    /**
+     * The exact URL handed to the player.
+     *
+     * <p>Kept because the index alone does not survive the source list being re-sorted, and
+     * because it is not always the channel's own entry: catchup plays a built URL. It is the only
+     * reliable way to find where playback has ended up after a re-rank.
+     */
+    private String mPlayingUrl;
+    /** The source last written to the store, so a stall does not rewrite it. */
+    private String mRememberedGoodSource;
     private boolean mDestroyed = false;
 
     /** Catchup (回看) playback: playing a time-shifted stream instead of live. */
@@ -90,6 +116,29 @@ public class MainActivity extends Activity {
     private final StringBuilder mNumberInput = new StringBuilder();
     private final Runnable mNumberCommitRunnable = this::commitNumberInput;
 
+    /**
+     * The screen fits the remote cycles through, in presentation order. The one that fills the
+     * screen leads, because that is what an unboxed app is expected to do; the ones that preserve
+     * the picture's shape follow.
+     */
+    private static final int[] SCREEN_SCALES = {
+            VideoView.SCREEN_SCALE_MATCH_PARENT,
+            VideoView.SCREEN_SCALE_CENTER_CROP,
+            VideoView.SCREEN_SCALE_16_9,
+            VideoView.SCREEN_SCALE_4_3,
+            VideoView.SCREEN_SCALE_ORIGINAL,
+            VideoView.SCREEN_SCALE_DEFAULT,
+    };
+
+    /** One press of LEFT/RIGHT while rewinding locally. */
+    private static final long LOCAL_SHIFT_STEP_MS = 30_000;
+
+    /** How close to the live edge counts as live again. */
+    private static final long LOCAL_LIVE_EDGE_MARGIN_MS = 2_000;
+
+    /** How far back the local-shift bar draws, so the live thumb is not glued to its right edge. */
+    private static final long LOCAL_SHIFT_WINDOW_MS = 30 * 60 * 1000;
+
     /** How long OK must be held to mean "long press" rather than "select". */
     private static final long OK_LONG_PRESS_MS = 600;
     private final Runnable mOkLongPressRunnable = this::onOkLongPress;
@@ -104,6 +153,10 @@ public class MainActivity extends Activity {
         mVideoView = findViewById(R.id.video_view);
         // Configure VideoView to use ExoPlayer instead of default Android MediaPlayer
         mVideoView.setPlayerFactory(new ExoMediaPlayerFactory());
+        // These streams are rarely the shape of the screen; stretch to fill unless the user has
+        // chosen to keep the shape.
+        mVideoView.setScreenScaleType(AppConfig.getScreenScaleType());
+        mVideoView.setMaxVideoHeight(VideoQuality.maxHeight(AppConfig.getVideoQuality()));
         mChannelRepository = new ChannelRepository(this);
         mNavigator = new ChannelNavigator();
         mEpgManager = new EpgManager(this);
@@ -125,6 +178,12 @@ public class MainActivity extends Activity {
                 rootView.addView(mVideoView);
             }
         }
+
+        // First-launch cover. A television showing nothing is indistinguishable from one that
+        // crashed; this says a download is in progress and gives the viewer something moving to
+        // look at until the cached playlist or the first channel appears.
+        mLoadingOverlay = new LoadingOverlay(this);
+        rootView.addView(mLoadingOverlay, mLoadingOverlay.createLayoutParams());
 
         // Add bottom playback info bar
         mPlaybackInfoComponent = new PlaybackInfoComponent(this);
@@ -213,14 +272,33 @@ public class MainActivity extends Activity {
             @Override
             public void onChannelsChanged(java.util.List<com.cabletv.player.model.ChannelGroup> channels) {
                 Log.i(TAG, "Channels updated: " + channels.size());
-                // On initial load, try to resume last played channel; on subsequent reloads, reset to first
+                // Which channel to show. The first callback of a launch restores what was last
+                // watched; later ones are the background refresh replacing the cached playlist.
                 if (mIsInitialLoad) {
                     mIsInitialLoad = false;
-                    mCurrentChannelIndex = mChannelRepository.getCurrentChannelIndex(AppConfig.getLastChannelUrl());
-                    Log.d(TAG, "Initial load: restoring last channel with url=" + AppConfig.getLastChannelUrl() + ", index=" + mCurrentChannelIndex);
+                    // The last URL watched is a better key than the channel number, but it is
+                    // whatever was playing when the box was switched off - possibly a catchup
+                    // stream, and possibly a source that has since died. The last *good* source is
+                    // the one playback actually reached, so it is preferred, and whichever is
+                    // used only selects the channel: the source order comes from applyOrder().
+                    String remembered = SourceSpeedStore.lastGood();
+                    if (remembered == null) {
+                        remembered = AppConfig.getLastChannelUrl();
+                    }
+                    mCurrentChannelIndex = mChannelRepository.getCurrentChannelIndex(remembered);
+                    Log.d(TAG, "Initial load: restoring channel for url=" + remembered
+                            + ", index=" + mCurrentChannelIndex);
                 } else {
-                    mCurrentChannelIndex = 0;
-                    Log.d(TAG, "Subsequent reload: resetting to first channel");
+                    // A refresh must not change the channel. Resetting to the first entry is only
+                    // right when nothing is playing yet, which is the case when the cached
+                    // playlist has not been published - otherwise it interrupts whatever the
+                    // viewer is watching, every single launch, a few seconds in. It is also how a
+                    // launch ends up on whatever junk heads the refreshed list.
+                    int previous = mCurrentChannelIndex;
+                    mCurrentChannelIndex = indexOfChannelWithSameName(
+                            mChannelRepository.getChannel(previous));
+                    Log.d(TAG, "Subsequent reload: keeping the viewer on channel index "
+                            + mCurrentChannelIndex + " (was " + previous + ")");
                 }
                 // Group the new playlist, and start the channel keys in the group holding whatever
                 // is about to play
@@ -238,7 +316,16 @@ public class MainActivity extends Activity {
                 java.util.List<Channel> allChannels = mChannelRepository.getAllChannels();
                 if (allChannels != null && !allChannels.isEmpty()) {
                     mEpgManager.preloadEpgForAllChannels(allChannels);
+                    startSourceProbe(allChannels);
                 }
+                // Something is about to be shown, so the cover comes down before the tune rather
+                // than after: from here on the screen has either a picture or a status message.
+                hideLoadingOverlay();
+                // Only the channel about to be shown needs its sources ranked, and playChannel()
+                // does that for it. Ranking the whole playlist here used to sort two hundred and
+                // forty channels on the main thread while the first frame was being decoded,
+                // which is what dropped the hundred-odd frames and stalled the UI for seconds.
+                // The rest are ranked by the probe's callback, off this thread.
                 playChannel(mCurrentChannelIndex);
             }
         };
@@ -265,6 +352,12 @@ public class MainActivity extends Activity {
                     android.widget.Toast.LENGTH_LONG).show();
         }
 
+        // Cover the black screen for as long as there is genuinely nothing to watch. The cached
+        // playlist usually lands within a few hundred milliseconds, and the overlay's fade is
+        // shorter than that.
+        if (mChannelRepository.getChannelCount() == 0) {
+            showLoadingOverlay();
+        }
         mChannelRepository.reload();
 
         // Set up audio manager for volume control
@@ -310,6 +403,51 @@ public class MainActivity extends Activity {
                 mLastM3uConfigSignature = m3uConfigSignature();
                 mChannelRepository.reload();
             }
+
+            @Override
+            public void onSourceSpeedChanged(boolean enabled) {
+                Log.d(TAG, "Source probing " + (enabled ? "enabled" : "disabled"));
+                // Turning it off stops the work in flight; the results it already gathered stay.
+                if (!enabled) {
+                    SourceSpeedTester.cancelBackground();
+                }
+            }
+
+            @Override
+            public void onSourceRemeasureRequested() {
+                Log.d(TAG, "Source remeasure requested from the web page");
+                java.util.List<Channel> allChannels = mChannelRepository.getAllChannels();
+                if (allChannels == null || allChannels.isEmpty()) {
+                    return;
+                }
+                // Measuring what is already known as well, since a source that died since it was
+                // last measured is exactly what a manual re-measure is for.
+                SourceSpeedStore.clear();
+                startSourceProbe(new ArrayList<>(allChannels));
+            }
+
+            @Override
+            public void onMediaCacheChanged(boolean enabled, long maxBytes) {
+                Log.d(TAG, "Media cache " + (enabled ? "on" : "off") + " max=" + maxBytes);
+                xyz.doikki.videoplayer.exo.ExoMediaSourceHelper helper =
+                        xyz.doikki.videoplayer.exo.ExoMediaSourceHelper.getInstance(
+                                getApplicationContext());
+                helper.setCacheEnabled(enabled);
+                helper.setCacheMaxBytes(maxBytes);
+            }
+
+            @Override
+            public void onMediaCacheCleared() {
+                Log.d(TAG, "Media cache cleared from the web page");
+                xyz.doikki.videoplayer.exo.ExoMediaSourceHelper.getInstance(
+                        getApplicationContext()).clearCache();
+            }
+
+            @Override
+            public void onVideoQualityChanged(int tier) {
+                Log.d(TAG, "Video quality changed to tier " + tier);
+                mVideoView.setMaxVideoHeight(VideoQuality.maxHeight(tier));
+            }
         });
         if (AppConfig.isWebServerEnabled()) {
             ConfigWebServer.startServer(this);
@@ -318,6 +456,13 @@ public class MainActivity extends Activity {
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        // While the search box is open, the remote's letter keys type into it instead of
+        // navigating. This is checked before key mapping because the letters a viewer needs -
+        // "hnws" for 湖南卫视 - are not mapped to anything, and would otherwise fall through to
+        // the system unmapped.
+        if (handleSearchKey(event)) {
+            return true;
+        }
         KeyMapping.Action action = KeyMapping.resolve(event.getKeyCode());
         if (action == null) {
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
@@ -365,6 +510,15 @@ public class MainActivity extends Activity {
             case SOURCE_SWITCH:
                 handleSourceSwitch();
                 return true;
+            case SCREEN_SCALE:
+                handleScreenScale();
+                return true;
+            case QUALITY:
+                handleQuality();
+                return true;
+            case SEARCH:
+                handleSearch();
+                return true;
             default:
                 int digit = digitFor(action);
                 if (digit >= 0) {
@@ -375,10 +529,143 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * Routes keys into the channel search while its box is open.
+     *
+     * <p>The alphabet is taken from the key events' Unicode character rather than from a table of
+     * key codes, so a remote that reports letters, digits, and even a soft keyboard on a phone all
+     * work through the same path.
+     *
+     * @return true when the key was consumed by the search
+     */
+    private boolean handleSearchKey(KeyEvent event) {
+        if (mChannelListComponent == null
+                || !mChannelListVisible
+                || !mChannelListComponent.isSearchActive()) {
+            return false;
+        }
+        if (event.getAction() != KeyEvent.ACTION_DOWN) {
+            // Still consume the release: letting it through would reach a view that has no idea
+            // the press ever happened.
+            return true;
+        }
+        int keyCode = event.getKeyCode();
+        if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_ESCAPE) {
+            mChannelListComponent.closeSearch();
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_DEL) {
+            mChannelListComponent.deleteSearchCharacter();
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN
+                || keyCode == KeyEvent.KEYCODE_CHANNEL_DOWN
+                || keyCode == KeyEvent.KEYCODE_PAGE_DOWN) {
+            mChannelListComponent.moveSearchSelection(true);
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_DPAD_UP
+                || keyCode == KeyEvent.KEYCODE_CHANNEL_UP
+                || keyCode == KeyEvent.KEYCODE_PAGE_UP) {
+            mChannelListComponent.moveSearchSelection(false);
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER
+                || keyCode == KeyEvent.KEYCODE_ENTER
+                || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+                || keyCode == KeyEvent.KEYCODE_BUTTON_A) {
+            // OK tunes whatever the search highlights. Selecting out of a search is the whole
+            // point of typing, so it does not require leaving the search first.
+            mChannelListComponent.confirmSelection();
+            hideChannelList();
+            mChannelListVisible = false;
+            return true;
+        }
+        int typed = event.getUnicodeChar();
+        if (typed != 0 && !Character.isISOControl(typed)) {
+            mChannelListComponent.appendSearchCharacter((char) typed);
+            return true;
+        }
+        // Arrows and anything else: navigate the list rather than the search.
+        return false;
+    }
+
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         ImmersiveMode.onWindowFocusChanged(this, hasFocus);
+    }
+
+    /**
+     * Cycles the picture-quality ceiling.
+     *
+     * <p>Most of these stations send one rendition and the tiers change nothing, which is why this
+     * is a keystroke and not a menu: it costs one press to find out, and the ceiling still helps
+     * on the sources that do carry several, where adapting down keeps a weak line watchable
+     * instead of sputtering.
+     */
+    private void handleQuality() {
+        int current = AppConfig.getVideoQuality();
+        int next = VideoQuality.next(current);
+        AppConfig.setVideoQuality(next);
+        mVideoView.setMaxVideoHeight(VideoQuality.maxHeight(next));
+        android.widget.Toast.makeText(this, qualityLabel(next),
+                android.widget.Toast.LENGTH_SHORT).show();
+    }
+
+    private int qualityLabel(int tier) {
+        switch (tier) {
+            case VideoQuality.TIER_1080P:
+                return R.string.quality_1080p;
+            case VideoQuality.TIER_720P:
+                return R.string.quality_720p;
+            case VideoQuality.TIER_480P:
+                return R.string.quality_480p;
+            default:
+                return R.string.quality_auto;
+        }
+    }
+
+    /**
+     * Cycles how the picture is fitted to the screen.
+     *
+     * <p>Every fit is a trade, and which one is right depends on the station and on who is
+     * watching, so they are all one button apart rather than picked once in a settings screen:
+     * stretching fills the screen and costs a little shape, cropping fills it without distortion
+     * and costs the edges, and the ratio fits keep the shape at the cost of black bars.
+     */
+    private void handleScreenScale() {
+        int current = AppConfig.getScreenScaleType();
+        int index = -1;
+        for (int i = 0; i < SCREEN_SCALES.length; i++) {
+            if (SCREEN_SCALES[i] == current) {
+                index = i;
+                break;
+            }
+        }
+        // A stored value outside the list falls through to the first entry.
+        int next = SCREEN_SCALES[(index + 1) % SCREEN_SCALES.length];
+        AppConfig.setScreenScaleType(next);
+        mVideoView.setScreenScaleType(next);
+        android.widget.Toast.makeText(this, scaleLabel(next),
+                android.widget.Toast.LENGTH_SHORT).show();
+    }
+
+    private int scaleLabel(int scaleType) {
+        switch (scaleType) {
+            case VideoView.SCREEN_SCALE_MATCH_PARENT:
+                return R.string.scale_fill;
+            case VideoView.SCREEN_SCALE_CENTER_CROP:
+                return R.string.scale_crop;
+            case VideoView.SCREEN_SCALE_16_9:
+                return R.string.scale_16_9;
+            case VideoView.SCREEN_SCALE_4_3:
+                return R.string.scale_4_3;
+            case VideoView.SCREEN_SCALE_ORIGINAL:
+                return R.string.scale_original;
+            default:
+                return R.string.scale_fit;
+        }
     }
 
     /**
@@ -559,7 +846,20 @@ public class MainActivity extends Activity {
             return;
         }
         if (!channel.hasCatchup()) {
-            mTimeShiftBar.hide();
+            // No server-side replay: fall back to the local shift, which works on any source the
+            // player can seek within. The bar then shows how far behind live the viewer is.
+            if (mLocalShiftActive) {
+                long behind = localShiftBehindMs();
+                mTimeShiftBar.setChannelLabel(channel.name);
+                mTimeShiftBar.setBackToLiveVisible(true);
+                mTimeShiftBar.setWindow(now - LOCAL_SHIFT_WINDOW_MS, now, now - behind);
+                if (forceShow) {
+                    mTimeShiftBar.show();
+                    startTimeShiftTicker();
+                }
+            } else {
+                mTimeShiftBar.hide();
+            }
             return;
         }
         // Live: the window runs from the programme start to now.
@@ -985,6 +1285,68 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * Whether the player is holding enough of the stream to rewind within it. Most public sources
+     * offer no server-side replay, so this is the only timeshift most channels will ever have.
+     */
+    private boolean isLocalShiftAvailable() {
+        return mVideoView != null && mVideoView.getBufferedPosition() > 0
+                && mVideoView.getCurrentPosition() > 0;
+    }
+
+    /** Rewinds within what the player has buffered, entering the local shift if not already in it. */
+    private void rewindLocally() {
+        if (!isLocalShiftAvailable()) {
+            return;
+        }
+        if (!mLocalShiftActive) {
+            mLocalShiftActive = true;
+            mShiftTargetMs = mVideoView.getCurrentPosition();
+        }
+        // Rewinding past the start of what we hold would just stall at the beginning, so the
+        // oldest reachable moment is the floor.
+        long floor = 0;
+        mShiftTargetMs = Math.max(floor, mShiftTargetMs - LOCAL_SHIFT_STEP_MS);
+        mVideoView.seekTo(mShiftTargetMs);
+        refreshTimeShiftBar(true);
+    }
+
+    /** Steps back towards the live edge, and leaves the local shift when it catches up. */
+    private void fastForwardLocally() {
+        if (!mLocalShiftActive || mVideoView == null) {
+            return;
+        }
+        long liveEdge = mVideoView.getBufferedPosition();
+        mShiftTargetMs += LOCAL_SHIFT_STEP_MS;
+        if (mShiftTargetMs >= liveEdge - LOCAL_LIVE_EDGE_MARGIN_MS) {
+            exitLocalShiftToLive();
+            return;
+        }
+        mVideoView.seekTo(mShiftTargetMs);
+        refreshTimeShiftBar(true);
+    }
+
+    /** Drops the local shift and jumps to the live edge. */
+    private void exitLocalShiftToLive() {
+        mLocalShiftActive = false;
+        mShiftTargetMs = 0;
+        if (mVideoView != null) {
+            mVideoView.seekTo(mVideoView.getBufferedPosition());
+        }
+        refreshTimeShiftBar();
+        if (mTimeShiftBar != null) {
+            mTimeShiftBar.hideSmooth();
+        }
+    }
+
+    /** How far behind the live edge the local shift currently is, in milliseconds. */
+    private long localShiftBehindMs() {
+        if (!mLocalShiftActive || mVideoView == null) {
+            return 0;
+        }
+        return Math.max(0, mVideoView.getBufferedPosition() - mShiftTargetMs);
+    }
+
     /** Left steps back through the three columns: programmes, channels, groups. */
     private void handleFocusLeft() {
         if (!mChannelListVisible || mChannelListComponent == null) {
@@ -992,6 +1354,10 @@ public class MainActivity extends Activity {
             // the viewer can rewind a programme they missed the start of.
             if (mCatchupActive) {
                 seekCatchup(-CATCHUP_SEEK_STEP_MS);
+            } else if (isLocalShiftAvailable()) {
+                // This channel has no server-side replay, so rewind what the player already
+                // holds instead. The segment cache is what makes it instant.
+                rewindLocally();
             } else {
                 enterCatchupFromLive();
             }
@@ -1014,9 +1380,12 @@ public class MainActivity extends Activity {
     /** Right steps forward through the three columns: groups, channels, programmes. */
     private void handleFocusRight() {
         if (!mChannelListVisible || mChannelListComponent == null) {
-            // Full-screen RIGHT fast-forwards the catchup playhead.
+            // Full-screen RIGHT fast-forwards the catchup playhead, or closes a local rewind
+            // towards the live edge, whichever is in progress.
             if (mCatchupActive) {
                 seekCatchup(CATCHUP_SEEK_STEP_MS);
+            } else if (mLocalShiftActive) {
+                fastForwardLocally();
             }
             return;
         }
@@ -1115,6 +1484,9 @@ public class MainActivity extends Activity {
                     mChannelListVisible = false;
                 }
             });
+            // The gear in the list header opens the settings; MENU leads into the list rather
+            // than into the form, so this is how the form is still one press from the remote.
+            mChannelListComponent.setOnSettingsRequestedListener(this::openSettingsFromMenu);
             // Tapping a programme row replays it (回看), the way long-pressing OK does.
             mChannelListComponent.setOnProgramClickListener((channel, program) -> {
                 if (channel == null || program == null || !channel.hasCatchup()) {
@@ -1175,8 +1547,83 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * Raises the loading cover, unless there is already something on screen worth watching.
+     *
+     * <p>A channel list already in memory means the app is only refreshing: the viewer keeps
+     * watching while it happens, so covering the picture would be an interruption rather than a
+     * courtesy.
+     */
+    private void showLoadingOverlay() {
+        if (mLoadingOverlay == null || mDestroyed) {
+            return;
+        }
+        if (mChannelRepository != null && mChannelRepository.getChannelCount() > 0) {
+            mLoadingOverlay.setDetail(getString(R.string.loading_refreshing));
+            return;
+        }
+        mAwaitingChannels = true;
+        mLoadingOverlay.show(getString(R.string.loading_channels),
+                getString(R.string.loading_channels_detail));
+    }
+
+    private void hideLoadingOverlay() {
+        mAwaitingChannels = false;
+        if (mLoadingOverlay != null) {
+            mLoadingOverlay.hide();
+        }
+    }
+
+    /**
+     * MENU opens the channel list down the left of the screen, not the settings screen.
+     *
+     * <p>MENU is what a viewer presses looking for "the other channels": on a television remote
+     * it is the channel-menu button, and dropping straight into a settings form is not what it
+     * was pressed for. Settings is one press away inside the list itself, which is also where
+     * groups, favourites and the EPG live - everything about what to watch, together.
+     */
     private void handleMenu() {
+        if (mChannelListVisible) {
+            // A second press closes it, the way it opened it.
+            hideChannelList();
+            mChannelListVisible = false;
+            return;
+        }
+        if (mChannelRepository.getChannelCount() == 0) {
+            // Nothing to list yet: the download is what the viewer is waiting on, and settings is
+            // where they can point the app at a different source if this one is not coming back.
+            startActivity(new Intent(this, SettingsActivity.class));
+            return;
+        }
+        mChannelListVisible = true;
+        showChannelList();
+    }
+
+    /** Opens the settings screen from inside the menu, keeping the menu behind it. */
+    private void openSettingsFromMenu() {
         startActivity(new Intent(this, SettingsActivity.class));
+    }
+
+    /**
+     * Opens the channel search, bringing the list up with it.
+     *
+     * <p>Search is reached from the remote as well as from inside the menu, so it has to be able
+     * to open the menu itself: a viewer pressing SEARCH while watching expects a search box, not
+     * an instruction to open the menu first.
+     */
+    private void handleSearch() {
+        if (mChannelRepository.getChannelCount() == 0) {
+            android.widget.Toast.makeText(this, R.string.search_nothing_loaded,
+                    android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (!mChannelListVisible) {
+            mChannelListVisible = true;
+            showChannelList();
+        }
+        mChannelListComponent.requestSearch();
+        android.widget.Toast.makeText(this, R.string.search_started,
+                android.widget.Toast.LENGTH_SHORT).show();
     }
 
     private void handleBack() {
@@ -1228,8 +1675,14 @@ public class MainActivity extends Activity {
         Channel channel = mChannelRepository.getChannel(index);
         Log.d(TAG, "Got channel from repository: " + (channel != null ? channel.name : "null"));
         if (channel != null) {
-            // A new channel always starts from its first source
+            // A new channel always starts from its first source, but the sources were sorted
+            // fastest-first first, so "first" means the one we know answers rather than the one
+            // the playlist happened to list. Failover then walks down that same order.
+            SourceSpeedTester.applyOrder(channel);
             mCurrentUrlIndex = 0;
+            // A new stream is a new timeline: any position held from the last one is meaningless.
+            mLocalShiftActive = false;
+            mShiftTargetMs = 0;
             final String url = channel.url();
             Log.d(TAG, "Playing channel: " + channel.name + " - " + url
                     + " (" + channel.urlCount() + " source(s))");
@@ -1261,6 +1714,7 @@ public class MainActivity extends Activity {
             case VideoView.STATE_BUFFERED:
                 // Stream is alive again: drop the backoff and clear the message
                 cancelReconnect();
+                rememberGoodSource();
                 break;
             case VideoView.STATE_PREPARING:
             case VideoView.STATE_BUFFERING:
@@ -1276,6 +1730,21 @@ public class MainActivity extends Activity {
                     // the live channel instead of hammering the catchup server.
                     exitCatchupToLive();
                     break;
+                }
+                if (mVideoView.getCurrentPlayState() == VideoView.STATE_ERROR
+                        && mVideoView.getLastErrorReason()
+                        == xyz.doikki.videoplayer.player.AbstractPlayer.PlayerEventListener.PLAYER_ERROR_BLOCKED) {
+                    // A DRM-protected stream, or one that answered with an anti-piracy notice
+                    // instead of the channel. Both play or refuse in a way no retry gets past -
+                    // reconnecting to the same source five times over is exactly what the viewer
+                    // is watching happen. Move on immediately.
+                    Log.w(TAG, "Blocked source, skipping: " + describeCurrentSource());
+                    markCurrentSourceDead();
+                    if (tryNextUrl()) {
+                        break;
+                    }
+                    // Every source is blocked or dead; worth one reconnect cycle in case it was
+                    // a transient licence failure rather than a permanent block.
                 }
                 // Live streams should never complete; when they do, the source dropped us.
                 // A dead source is worth replacing before waiting: try the channel's other
@@ -1294,6 +1763,92 @@ public class MainActivity extends Activity {
      *
      * @return true when another source was started, false when they have all been tried
      */
+    /**
+     * Probes the playlist's sources in the background, then reorders them so the next channel
+     * change opens a source we know answers.
+     *
+     * <p>The reordering has to come back to the main thread: it mutates the lists the player and
+     * the channel list are reading while the picture is up.
+     */
+    private void startSourceProbe(java.util.List<Channel> channels) {
+        if (mDestroyed || channels == null) {
+            return;
+        }
+        final java.util.List<Channel> target = new ArrayList<>(channels);
+        SourceSpeedTester.measureChannelsInBackground(target, () -> {
+            // On finish: re-rank every channel, then report back. The sorting itself stays on the
+            // probe's worker thread - it touches hundreds of lists, and doing it here would be
+            // the same main-thread stall the probe exists to avoid. What comes back to the main
+            // thread is only the one thing that needs it: which source the channel on screen is
+            // now pointing at.
+            SourceSpeedTester.applyOrder(target);
+            final Channel current = mChannelRepository.getChannel(mCurrentChannelIndex);
+            if (current != null) {
+                SourceSpeedTester.applyOrder(current);
+            }
+            mMainHandler.post(() -> {
+                if (mDestroyed) {
+                    return;
+                }
+                if (current != null) {
+                    // The sort moved the entries; the source that is playing has moved with them,
+                    // so the index failover walks from has to be corrected or it would point at
+                    // whatever now sits in the old slot.
+                    int index = current.getUrls().indexOf(mPlayingUrl);
+                    if (index >= 0) {
+                        mCurrentUrlIndex = index;
+                    }
+                }
+                Log.i(TAG, "Source ranking updated from " + SourceSpeedStore.size() + " measurements");
+            });
+        });
+    }
+
+    /**
+     * Remembers the source that just started playing, so the next launch can open on it.
+     *
+     * <p>Only called when the source has actually changed. A live stream raises the playing state
+     * again every time it recovers from a stall, and recording it each time would rewrite
+     * preferences - a synchronous write on a low-end box - in the middle of playback.
+     */
+    private void rememberGoodSource() {
+        if (mPlayingUrl == null || mPlayingUrl.equals(mRememberedGoodSource)) {
+            return;
+        }
+        mRememberedGoodSource = mPlayingUrl;
+        Channel channel = mChannelRepository.getChannel(mCurrentChannelIndex);
+        if (channel != null && mPlayingUrl.equals(channel.urlAt(mCurrentUrlIndex))) {
+            // Only the channel's own sources are worth remembering. A catchup URL is built for a
+            // past programme and would be stale by the next launch.
+            SourceSpeedStore.markLastGood(mPlayingUrl);
+        }
+    }
+
+    /** The source that is currently playing, for log lines. */
+    private String describeCurrentSource() {
+        Channel channel = mChannelRepository.getChannel(mCurrentChannelIndex);
+        if (channel == null) {
+            return "none";
+        }
+        return channel.name + " @ " + channel.urlAt(mCurrentUrlIndex);
+    }
+
+    /**
+     * Records that the current source is not merely slow but unusable, so it is not tried first
+     * again on the next channel change.
+     *
+     * <p>Stored with the worst possible latency rather than being deleted: the prober skips
+     * sources it already knows, so an entry is what stops this one being measured and ranked
+     * straight back to the top. It is unambiguously a dead end, whatever its measured speed was.
+     */
+    private void markCurrentSourceDead() {
+        Channel channel = mChannelRepository.getChannel(mCurrentChannelIndex);
+        if (channel == null) {
+            return;
+        }
+        SourceSpeedStore.markUnusable(channel.urlAt(mCurrentUrlIndex));
+    }
+
     private boolean tryNextUrl() {
         if (mDestroyed) {
             return false;
@@ -1343,11 +1898,50 @@ public class MainActivity extends Activity {
         if (channel == null) {
             return;
         }
-        Log.i(TAG, "Reconnect attempt " + mReconnectAttempt + " for " + channel.name);
-        // Start the whole list over: the source that failed a moment ago may well be back, and
-        // the ones after it get another turn through tryNextUrl().
-        mCurrentUrlIndex = 0;
-        restartPlayer(channel, channel.url());
+        // Retry the source that failed, not the first one in the list.
+        //
+        // Resetting the index to 0 here used to look harmless - "start the list over" - and was
+        // the reason a channel whose first source is dead never played at all. tryNextUrl() walks
+        // forward from the current index, so after each failure the index moved on to a source
+        // that worked; the reconnect then threw that progress away and pointed the player back at
+        // the dead first entry. Every retry re-tested the same unreachable host while a dozen
+        // usable sources sat untouched behind it, and the screen stayed black for the full
+        // minute and a half of the backoff schedule.
+        String url = channel.urlAt(mCurrentUrlIndex);
+        Log.i(TAG, "Reconnect attempt " + mReconnectAttempt + " for " + channel.name
+                + " (source " + (mCurrentUrlIndex + 1) + "/" + channel.urlCount() + ")");
+        if (url == null) {
+            // Nothing at this index: the list shrank under us, so start over.
+            mCurrentUrlIndex = 0;
+            url = channel.url();
+        }
+        restartPlayer(channel, url);
+    }
+
+    /**
+     * Finds the refreshed list's entry for the channel that was playing.
+     *
+     * <p>The playlist is reloaded underneath the viewer on every launch, and the new copy is a
+     * different set of objects in a possibly different order. Matching by name is what keeps the
+     * picture on the same channel across that; position alone would not survive the reordering,
+     * and the URL is exactly what changes when a source is swapped out.
+     *
+     * @param playing the channel that was on screen, or null when nothing was
+     * @return the index of the same channel in the refreshed list, or 0 when it is gone
+     */
+    private int indexOfChannelWithSameName(Channel playing) {
+        if (playing == null || playing.name == null) {
+            return 0;
+        }
+        java.util.List<Channel> channels = mChannelRepository.getAllChannels();
+        for (int i = 0; i < channels.size(); i++) {
+            Channel candidate = channels.get(i);
+            if (candidate != null && playing.name.equals(candidate.name)) {
+                return i;
+            }
+        }
+        Log.d(TAG, "Channel " + playing.name + " is gone from the refreshed playlist");
+        return 0;
     }
 
     /** Rebuilds the player: after an error the existing instance cannot be reused. */
@@ -1355,6 +1949,7 @@ public class MainActivity extends Activity {
         if (url == null) {
             return;
         }
+        mPlayingUrl = url;
         mVideoView.release();
         mVideoView.setUrl(url, channel.headers);
         mVideoView.start();
@@ -1406,6 +2001,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         mDestroyed = true;
+        // A probe still in flight would otherwise keep holding sockets open for an activity that
+        // is going away; the results it already measured are saved regardless.
+        SourceSpeedTester.cancelBackground();
         mMainHandler.removeCallbacks(mReconnectRunnable);
         mMainHandler.removeCallbacks(mNumberCommitRunnable);
         mMainHandler.removeCallbacks(mOkLongPressRunnable);

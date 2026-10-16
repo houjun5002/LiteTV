@@ -104,6 +104,19 @@
                     android:padding="12dp"
                     android:focusable="true" />
 
+                <!-- Picking a built-in source is the common case, and typing a URL on a remote is
+                     not; this makes switching one button press. -->
+                <Button
+                    android:id="@+id/pick_builtin_source_btn"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="@string/pick_builtin_source"
+                    android:background="@drawable/button_focus_selector"
+                    android:textColor="@color/text_primary"
+                    android:padding="12dp"
+                    android:focusable="true" />
+
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -500,6 +513,40 @@
                     android:padding="12dp"
                     android:layout_marginTop="8dp"
                     android:focusable="true" />
+
+                <!-- Open source: the project is meant to be editable, so the address and the
+                     licence it is under are part of what the app has to say about itself. -->
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/about_section"
+                    android:textColor="@color/colorAccent"
+                    android:textSize="16sp"
+                    android:textStyle="bold"
+                    android:layout_marginTop="20dp"
+                    android:layout_marginBottom="8dp" />
+
+                <TextView
+                    android:id="@+id/about_project_text"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/text_primary"
+                    android:layout_marginBottom="4dp" />
+
+                <TextView
+                    android:id="@+id/about_source_url"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp"
+                    android:layout_marginBottom="8dp" />
+
+                <TextView
+                    android:id="@+id/about_license_text"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp" />
 
             </LinearLayout>
 

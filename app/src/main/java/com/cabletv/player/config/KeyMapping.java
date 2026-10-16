@@ -21,7 +21,13 @@ public class KeyMapping {
         RIGHT,
         NUM_0, NUM_1, NUM_2, NUM_3, NUM_4, NUM_5, NUM_6, NUM_7, NUM_8, NUM_9,
         /** Cycles through the channel's own sources when a playlist lists several for it. */
-        SOURCE_SWITCH
+        SOURCE_SWITCH,
+        /** Cycles how the picture is fitted to the screen. */
+        SCREEN_SCALE,
+        /** Cycles the picture-quality ceiling. */
+        QUALITY,
+        /** Opens the channel search. */
+        SEARCH
     }
 
     private static final int[] DEFAULT_KEYCODES = {
@@ -44,7 +50,10 @@ public class KeyMapping {
             KeyEvent.KEYCODE_7,
             KeyEvent.KEYCODE_8,
             KeyEvent.KEYCODE_9,
-            KeyEvent.KEYCODE_R             // SOURCE_SWITCH (R for source)
+            KeyEvent.KEYCODE_R,            // SOURCE_SWITCH (R for source)
+            KeyEvent.KEYCODE_INFO,         // SCREEN_SCALE (the remote's info button)
+            KeyEvent.KEYCODE_A,            // QUALITY (A for the picture it shows)
+            KeyEvent.KEYCODE_S             // SEARCH (S for search; several remotes have it)
     };
 
     static {
@@ -52,7 +61,7 @@ public class KeyMapping {
     }
 
     private static final String KEY_MAPPING_VERSION_KEY = "app_key_mapping_version";
-    private static final int MAPPING_SCHEMA_VERSION = 3;
+    private static final int MAPPING_SCHEMA_VERSION = 6;
 
     /**
      * Applies defaults when nothing has ever been stored, and upgrades older stored mappings
@@ -73,6 +82,13 @@ public class KeyMapping {
             }
             if (!obj.has(Action.SOURCE_SWITCH.name())) {
                 obj.addProperty(Action.SOURCE_SWITCH.name(), DEFAULT_KEYCODES[Action.SOURCE_SWITCH.ordinal()]);
+            }
+            if (Hawk.get(KEY_MAPPING_VERSION_KEY, 1) < 5) {
+                obj.addProperty(Action.SCREEN_SCALE.name(), DEFAULT_KEYCODES[Action.SCREEN_SCALE.ordinal()]);
+                obj.addProperty(Action.QUALITY.name(), DEFAULT_KEYCODES[Action.QUALITY.ordinal()]);
+            }
+            if (Hawk.get(KEY_MAPPING_VERSION_KEY, 1) < 6) {
+                obj.addProperty(Action.SEARCH.name(), DEFAULT_KEYCODES[Action.SEARCH.ordinal()]);
             }
             Hawk.put(KEY_MAPPING_KEY, obj.toString());
         }

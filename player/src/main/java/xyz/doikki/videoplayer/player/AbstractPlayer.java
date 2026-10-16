@@ -124,6 +124,26 @@ public abstract class AbstractPlayer {
     public abstract int getBufferedPercentage();
 
     /**
+     * The furthest position the player has buffered, in milliseconds.
+     *
+     * <p>Not left abstract: only ExoPlayer can answer it, and every caller has to cope with not
+     * knowing anyway - a live stream may not be seekable at all.
+     *
+     * @return the buffered position, or the current position when it is unknown
+     */
+    public long getBufferedPosition() {
+        return getCurrentPosition();
+    }
+
+    /**
+     * Caps the video height, or 0 for no cap. Only some sources carry several renditions, so this
+     * is a request: a stream with one quality ignores it, and a caller that assumed otherwise
+     * would be showing the viewer a menu that does nothing.
+     */
+    public void setMaxVideoHeight(int height) {
+    }
+
+    /**
      * 设置渲染视频的View,主要用于TextureView
      */
     public abstract void setSurface(Surface surface);
@@ -172,7 +192,27 @@ public abstract class AbstractPlayer {
 
     public interface PlayerEventListener {
 
+        /** The stream failed for some unspecified reason. */
+        int PLAYER_ERROR_UNKNOWN = 0;
+
+        /**
+         * The stream was refused rather than broken: a DRM check or a substituted
+         * anti-piracy notice. Retrying and format-switching cannot help; only another
+         * source can.
+         */
+        int PLAYER_ERROR_BLOCKED = 1;
+
         void onError();
+
+        /**
+         * The stream failed, with a reason.
+         *
+         * <p>Not abstract: a player that cannot tell the cases apart reports the unknown one,
+         * and callers must handle it anyway.
+         */
+        default void onError(int reason) {
+            onError();
+        }
 
         void onCompletion();
 

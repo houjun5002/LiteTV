@@ -1,0 +1,81 @@
+package com.cabletv.player.config;
+
+/**
+ * The first letter of a Chinese character's pinyin, for searching channel names.
+ *
+ * <p>Typing a Chinese channel name on a television remote is not something anyone
+ * wants to do, so search also matches a name's initials - and that needs to know how
+ * each character is pronounced.
+ *
+ * <p>Generated from the Unicode Unihan database's kMandarin readings by
+ * {@code tools/gen_pinyin.py}, so it is correct by construction rather than typed by
+ * hand, and can be regenerated as the channel vocabulary changes. It is deliberately
+ * scoped to the characters that appear in channel, group and station names rather
+ * than the whole CJK block: the full table is some twenty thousand characters and
+ * would be the largest thing in the APK, for a search that only ever sees these.
+ *
+ * <p>A character outside the table returns null, and the caller falls back to
+ * matching the name itself - so a missing entry can only ever miss a match, never
+ * make a wrong one.
+ *
+ * <p>Do not edit by hand.
+ */
+final class PinyinInitials {
+
+    private static final int FIRST_CHAR = 0x4E00;
+    private static final int LAST_CHAR = 0x9FFF;
+
+    /** Indexed by character - FIRST_CHAR; 0 means unknown, otherwise 'a'..'z'. */
+    private static final byte[] INITIALS = buildInitials();
+
+    private static byte[] buildInitials() {
+        byte[] table = new byte[LAST_CHAR - FIRST_CHAR + 1];
+        put(table, 'a', "\u50B2\u5B89\u6FB3\u7231");
+        put(table, 'b', "\u4E0D\u4EB3\u4F34\u516B\u5175\u51B0\u5305\u5317\u534A\u53D8\u5575\u5B9D\u5DF4\u5E03\u5E2E\u6016\u62B1\u640F\u64AD\u672C\u6807\u699C\u6B65\u6EE8\u7206\u7248\u73BB\u767D\u767E\u7891\u78A7\u7B14\u7F16\u8FB9\u90E8\u98D9");
+        put(table, 'c', "\u4ECE\u4F20\u51FA\u5531\u573A\u57CE\u5BA0\u5C18\u5D07\u5DDD\u5F69\u6210\u63AA\u660C\u6625\u671D\u6751\u6A59\u6C60\u6F6E\u7960\u7FE0\u82CD\u8349\u85CF\u8D22\u8D85\u8F66\u9519\u9648\u9A70");
+        put(table, 'd', "\u4E1C\u4E39\u4EE3\u515A\u5178\u5200\u5230\u52A8\u54D2\u5730\u591A\u5927\u5B9A\u5BF9\u5BFC\u5C9B\u5F1F\u5F53\u5F97\u5FB7\u6566\u65AD\u6735\u706F\u7535\u7538\u7684\u7AEF\u7B2C\u7B49\u8C0D\u9012\u9053\u90F8\u90FD\u961F\u96D5\u9876\u9F0E");
+        put(table, 'e', "\u4E8C\u513F\u5C14\u5CE8");
+        put(table, 'f', "\u4E30\u4F5B\u51E4\u53CD\u53D1\u574A\u592B\u5BCC\u5C01\u5CF0\u65B9\u670D\u6CD5\u6DAA\u7236\u72AF\u798F\u7FE1\u8BBF\u961C\u98CE\u98DE");
+        put(table, 'g', "\u4E2A\u516C\u5171\u5173\u521A\u529F\u53E4\u5495\u54E5\u560E\u56FA\u56FD\u591F\u59D1\u5BAB\u5E7F\u611F\u641E\u6545\u66F4\u6746\u679C\u6842\u6B4C\u6C9F\u6E2F\u704C\u7518\u89C2\u8C37\u8D21\u8D2D\u8D35\u8FC7\u9505\u9AD8\u9F13");
+        put(table, 'h', "\u4F1A\u51F0\u5316\u534E\u5408\u540E\u548C\u54C8\u56DE\u597D\u5E7B\u5FBD\u6000\u6052\u60E0\u676D\u6866\u6B22\u6C49\u6CB3\u6D2A\u6D3B\u6D77\u6DEE\u6E56\u706B\u753B\u7687\u7EA2\u822A\u82B1\u8C0E\u8D3A\u8F89\u90AF\u9B42\u9E3F\u9E6E\u9EC4\u9ED1");
+        put(table, 'j', "\u4E5D\u4E95\u4EAC\u4F73\u5065\u519B\u51FB\u5251\u5267\u52A0\u53E5\u5409\u5609\u5939\u59D0\u5B63\u5BB6\u5C06\u5EFA\u60CA\u6280\u6324\u6559\u65E7\u664B\u666F\u66A8\u673A\u6770\u6781\u6C5F\u6D25\u6D4E\u754C\u7586\u775B\u7ADE\u7CBE\u7EA7\u7EAA\u7ECF\u8282\u8346\u89D2\u8BA1\u8BB0\u8FDB\u9152\u91D1\u95F4\u9645\u9756");
+        put(table, 'k', "\u514B\u523B\u5361\u53E3\u594E\u5BA2\u5EB7\u5F00\u6050\u72C2\u77B0\u79D1\u7A7A\u82E6\u9177\u9997");
+        put(table, 'l', "\u4E3D\u4E50\u4E86\u4EE4\u4FA3\u516D\u5170\u5217\u5218\u5386\u5784\u5C9A\u5CAD\u5D02\u5F55\u65C5\u674E\u6765\u6797\u67F3\u6881\u68A8\u697C\u6CEA\u6CF8\u6D41\u6D6A\u6EA7\u6F13\u70C8\u7281\u72FC\u7406\u7483\u7559\u79BB\u7ACB\u7BEE\u7EDC\u7F57\u8001\u82A6\u83B2\u84DD\u8BBA\u8C05\u8DEF\u8FA3\u8FBD\u8FDE\u91CC\u9675\u9686\u9E7F\u9F99");
+        put(table, 'm', "\u4E48\u4EEC\u540D\u54AA\u5988\u660E\u6885\u68A6\u6BCD\u6BDB\u6C11\u6CA1\u6EE1\u6F2B\u7267\u731B\u732B\u739B\u7709\u7801\u7F8E\u8393\u840C\u8499\u871C\u8D38\u8FF7\u95E8\u9762\u9A6C\u9E23");
+        put(table, 'n', "\u4F60\u5185\u519C\u5357\u5973\u5A18\u5B81\u5E74\u62C8\u725B\u7EB3\u80FD\u96BE\u9E1F");
+        put(table, 'o', "\u5076");
+        put(table, 'p', "\u54C1\u5761\u5A46\u5E73\u62CD\u6392\u666E\u670B\u6F58\u7011\u7247\u724C\u76D8\u78D0\u83E9\u8BC4\u9891\u9E4F");
+        put(table, 'q', "\u4E03\u5168\u524D\u533A\u5343\u5374\u53BB\u5668\u5947\u5E86\u60C5\u66F2\u67AA\u6C42\u6CC9\u6E05\u6E20\u7403\u7941\u79E6\u8862\u94B1\u9752");
+        put(table, 'r', "\u4EBA\u4EC1\u5BB9\u65E5\u70ED\u7136\u745E\u7ED5\u8363\u8BA9");
+        put(table, 's', "\u4E09\u4E0A\u4E16\u4E27\u4E66\u4E8B\u4F24\u5341\u53A6\u53CC\u53F2\u5546\u56DB\u5723\u58EB\u58F0\u59CB\u5B9E\u5BFA\u5C04\u5C11\u5C1A\u5C38\u5C71\u5C81\u5D4A\u5E02\u5E08\u609A\u6536\u6570\u65AF\u65F6\u662F\u677E\u6811\u68EE\u6B59\u6C0F\u6C34\u6C99\u6CD7\u6D12\u6DF1\u70E7\u72EE\u751F\u7701\u77F3\u793E\u795E\u79C1\u7ECD\u8083\u820D\u8212\u82CF\u8428\u89C6\u8BF4\u8D5B\u90B5\u9655\u968B\u98DF\u9996\u9F20");
+        put(table, 't', "\u4EAD\u4F53\u53F0\u542C\u5510\u56E2\u5802\u5854\u5929\u592A\u5957\u5C60\u5C6F\u5EAD\u633A\u6843\u6CF0\u6DD8\u6EE9\u7530\u773A\u7A81\u7AE5\u8DF3\u901A\u94DC\u9640");
+        put(table, 'w', "\u4E07\u4E4C\u4E94\u4F2A\u4F4D\u52A1\u5367\u536B\u543E\u5473\u5916\u5FAE\u5FD8\u6211\u6587\u65E0\u65FA\u665A\u671B\u672A\u6B66\u6C6A\u6C76\u6E7E\u7269\u738B\u7EAC\u7EF4\u7F51\u821E\u8587\u95FB");
+        put(table, 'x', "\u4E0B\u4E60\u4E61\u4ED9\u4F11\u4FA0\u4FE1\u50CF\u5144\u5174\u53BF\u53D9\u559C\u590F\u5B66\u5BFB\u5C0F\u5CE1\u5DF7\u5F62\u5F90\u5FC3\u6027\u60AC\u60F3\u620F\u65B0\u661F\u6653\u6EAA\u6F47\u70AB\u7199\u7384\u73B0\u76F8\u7B11\u7EBF\u8365\u8427\u8840\u884C\u8944\u897F\u8BAF\u8C61\u8D24\u90A2\u9521\u95F2\u96C4\u96EA\u9704\u971E\u9999\u9C9C");
+        put(table, 'y', "\u4E00\u4E0E\u4E1A\u4E49\u4E91\u4E9A\u4F0A\u4F18\u4F59\u501A\u5143\u517B\u533B\u5370\u539F\u53CB\u53F3\u56ED\u5830\u591C\u592E\u59DA\u5A31\u5B87\u5C7F\u5CB3\u5D16\u5E7C\u5EF6\u5F71\u5FA1\u6021\u62E5\u6396\u6613\u6620\u6708\u6709\u6C82\u6D0B\u6DAF\u6E38\u6F14\u70DF\u7259\u7389\u7591\u773C\u7814\u7FBD\u80B2\u827A\u82F1\u8425\u8BED\u8FDC\u91CE\u9633\u9662\u96C5\u96CD\u96E8\u97F3\u9C7C\u9E70\u9EDF");
+        put(table, 'z', "\u4E13\u4E2D\u4E3B\u4E4B\u4E89\u4F5C\u505A\u518D\u5236\u5468\u5634\u5728\u5733\u594F\u5B50\u5BB0\u5DDE\u5DE6\u5F20\u5F81\u600E\u6218\u6307\u653F\u6700\u6731\u6808\u6B63\u6CBB\u6D32\u6D59\u6F33\u73E0\u7504\u76F4\u7740\u77E5\u7EFC\u7F6A\u8005\u804C\u81EA\u81F3\u81F4\u821F\u88C5\u8BF8\u8D44\u8D70\u8DB3\u8F6C\u9189\u91CD\u9488\u949F\u9547\u957F");
+        return table;
+    }
+
+    private static void put(byte[] table, char letter, String characters) {
+        byte value = (byte) letter;
+        for (int i = 0; i < characters.length(); i++) {
+            int index = characters.charAt(i) - FIRST_CHAR;
+            if (index >= 0 && index < table.length) {
+                table[index] = value;
+            }
+        }
+    }
+
+    /** @return the lowercase initial of the character, or null when it is unknown. */
+    static String of(char c) {
+        int index = c - FIRST_CHAR;
+        if (index < 0 || index >= INITIALS.length) {
+            return null;
+        }
+        byte value = INITIALS[index];
+        return value == 0 ? null : String.valueOf((char) value);
+    }
+
+    private PinyinInitials() {
+    }
+}

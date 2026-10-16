@@ -5,6 +5,8 @@ import android.text.TextUtils;
 import android.util.Log;
 
 import com.cabletv.player.config.AppConfig;
+import com.cabletv.player.config.BuiltInSources;
+import com.cabletv.player.config.SourceSpeedStore;
 import com.cabletv.player.update.AppVersion;
 import com.cabletv.player.update.UpdateError;
 import com.cabletv.player.update.UpdateManager;
@@ -13,6 +15,7 @@ import com.cabletv.player.update.UpdateStatus;
 import com.cabletv.player.util.LocalPlaylistFolder;
 import com.google.gson.JsonObject;
 
+import xyz.doikki.videoplayer.exo.ExoMediaSourceHelper;
 import xyz.doikki.videoplayer.player.VideoViewConfig;
 
 import java.io.ByteArrayOutputStream;
@@ -68,6 +71,16 @@ public class ConfigWebServer {
         void onEpgPreferenceChanged(String preference);
         /** The local playlist was cleared (newPath is empty) from the web page. */
         void onM3uFileChanged(String newPath);
+        /** Automatic source probing was switched on or off. */
+        void onSourceSpeedChanged(boolean enabled);
+        /** The page asked for the sources to be measured again now. */
+        void onSourceRemeasureRequested();
+        /** The segment cache was resized or switched on or off. */
+        void onMediaCacheChanged(boolean enabled, long maxBytes);
+        /** The viewer emptied the segment cache from the page. */
+        void onMediaCacheCleared();
+        /** The picture-quality ceiling was changed. */
+        void onVideoQualityChanged(int tier);
     }
 
     /** Cleared by the Activity in onDestroy(); volatile because server threads read it. */
@@ -277,6 +290,21 @@ public class ConfigWebServer {
             } else if ("POST".equals(method) && "/config/update-install".equals(path)) {
                 response = handleUpdateInstallPost();
                 contentType = "application/json";
+            } else if ("POST".equals(method) && "/config/source-speed".equals(path)) {
+                response = handleSourceSpeedPost(body);
+                contentType = "application/json";
+            } else if ("POST".equals(method) && "/config/source-remeasure".equals(path)) {
+                response = handleSourceRemeasurePost();
+                contentType = "application/json";
+            } else if ("POST".equals(method) && "/config/media-cache".equals(path)) {
+                response = handleMediaCachePost(body);
+                contentType = "application/json";
+            } else if ("POST".equals(method) && "/config/media-cache-clear".equals(path)) {
+                response = handleMediaCacheClear();
+                contentType = "application/json";
+            } else if ("POST".equals(method) && "/config/quality".equals(path)) {
+                response = handleQualityPost(body);
+                contentType = "application/json";
             } else if ("POST".equals(method) && UPLOAD_PATH.equals(path)) {
                 response = handleM3uFileUpload(rawBody, requestContentType);
                 contentType = "application/json";
@@ -481,6 +509,162 @@ public class ConfigWebServer {
         return json.toString();
     }
 
+    /**
+     * Switches automatic source probing. The measurements already taken are kept either way:
+     * turning the probe off should not cost the viewer what the app already learned.
+     */
+    private static String handleSourceSpeedPost(String body) {
+        try {
+            Map<String, String> params = parseFormData(body);
+            String enabled = params.get("source_speed_enabled");
+            if (!isValidFlag(enabled)) {
+                return jsonResult(false, "Invalid source-speed setting");
+            }
+            if (enabled != null) {
+                AppConfig.setSourceSpeedEnabled("1".equals(enabled));
+                OnConfigChangeListener listener = sConfigChangeListener;
+                if (listener != null) {
+                    listener.onSourceSpeedChanged("1".equals(enabled));
+                }
+            }
+            return jsonResult(true, "Source speed setting saved");
+        } catch (Exception e) {
+            Log.e(TAG, "Error saving source speed setting", e);
+            return jsonResult(false, "Failed to save source speed setting");
+        }
+    }
+
+    /** Asks the television to measure the sources now, rather than waiting for the next launch. */
+    private static String handleSourceRemeasurePost() {
+        OnConfigChangeListener listener = sConfigChangeListener;
+        if (listener == null) {
+            return jsonResult(false, "Television not connected");
+        }
+        listener.onSourceRemeasureRequested();
+        return jsonResult(true, "Measuring sources on the television now");
+    }
+
+    /**
+     * Saves the segment-cache setting. The size is capped to a sane range, because this is the one
+     * setting that can cost the viewer storage: a typo in the page should not be able to ask for
+     * a cache the size of the disk.
+     */
+    private static String handleMediaCachePost(String body) {
+        try {
+            Map<String, String> params = parseFormData(body);
+            String enabled = params.get("media_cache_enabled");
+            String sizeMb = params.get("media_cache_size_mb");
+            if (!isValidFlag(enabled)) {
+                return jsonResult(false, "Invalid cache setting");
+            }
+            long bytes = -1;
+            if (sizeMb != null) {
+                int mb = Integer.parseInt(sizeMb);
+                if (mb < 0 || mb > 1024) {
+                    return jsonResult(false, "Cache size must be between 0 and 1024 MB");
+                }
+                bytes = mb * 1024L * 1024L;
+            }
+            boolean enabledValue = enabled != null && "1".equals(enabled);
+            if (enabled != null) {
+                AppConfig.setMediaCacheEnabled(enabledValue);
+            }
+            if (bytes >= 0) {
+                AppConfig.setMediaCacheMaxBytes(bytes);
+            }
+            OnConfigChangeListener listener = sConfigChangeListener;
+            if (listener != null) {
+                listener.onMediaCacheChanged(AppConfig.isMediaCacheEnabled(),
+                        AppConfig.getMediaCacheMaxBytes());
+            }
+            return jsonResult(true, "Cache setting saved");
+        } catch (Exception e) {
+            Log.e(TAG, "Error saving cache setting", e);
+            return jsonResult(false, "Failed to save cache setting");
+        }
+    }
+
+    /** Empties the segment cache on demand. */
+    private static String handleMediaCacheClear() {
+        Context appContext = sAppContext;
+        if (appContext == null) {
+            return jsonResult(false, "Server not ready");
+        }
+        ExoMediaSourceHelper.getInstance(appContext).clearCache();
+        OnConfigChangeListener listener = sConfigChangeListener;
+        if (listener != null) {
+            listener.onMediaCacheCleared();
+        }
+        return jsonResult(true, "Cache emptied");
+    }
+
+    /** Saves the picture-quality ceiling. */
+    private static String handleQualityPost(String body) {
+        try {
+            Map<String, String> params = parseFormData(body);
+            String tier = params.get("video_quality");
+            if (!isValidQuality(tier)) {
+                return jsonResult(false, "Invalid quality setting");
+            }
+            if (tier != null) {
+                AppConfig.setVideoQuality(Integer.parseInt(tier));
+                OnConfigChangeListener listener = sConfigChangeListener;
+                if (listener != null) {
+                    listener.onVideoQualityChanged(Integer.parseInt(tier));
+                }
+            }
+            return jsonResult(true, "Quality saved");
+        } catch (Exception e) {
+            Log.e(TAG, "Error saving quality setting", e);
+            return jsonResult(false, "Failed to save quality setting");
+        }
+    }
+
+    /**
+     * The playlists offered by the source picker: the app's built-ins, plus whatever is in use, so
+     * a custom URL is never silently replaced by the list when the page reloads.
+     */
+    private static java.util.List<String> appSourceList() {
+        java.util.List<String> sources = new java.util.ArrayList<>();
+        // The viewer's own URL first, so reloading the page never silently replaces it with a
+        // built-in; then the built-ins, in the order they would be tried.
+        String current = AppConfig.getM3uUrl();
+        if (current != null && !current.isEmpty()) {
+            sources.add(current);
+        }
+        for (BuiltInSources.Source source : BuiltInSources.all()) {
+            if (!sources.contains(source.url)) {
+                sources.add(source.url);
+            }
+        }
+        return sources;
+    }
+
+    /** Display names for the built-in playlists, so the picker says what each one is. */
+    private static java.util.Map<String, String> appSourceLabels() {
+        java.util.Map<String, String> labels = new java.util.LinkedHashMap<>();
+        for (BuiltInSources.Source source : BuiltInSources.all()) {
+            labels.put(source.url, source.label);
+        }
+        return labels;
+    }
+
+    /**
+     * What the segment cache holds. Only asked for when the cache is on, so the answer is not
+     * holding a lock on a cache nobody is using.
+     */
+    private static long cacheBytes(Context appContext) {
+        if (appContext == null || !AppConfig.isMediaCacheEnabled()) {
+            return 0;
+        }
+        return ExoMediaSourceHelper.getInstance(appContext).getCacheBytes();
+    }
+
+    private static boolean isValidQuality(String value) {
+        return value == null || "0".equals(value) || "1".equals(value)
+                || "2".equals(value) || "3".equals(value);
+    }
+
     private static String getConfigJson() {
         JsonObject config = new JsonObject();
         config.addProperty("m3u_url", AppConfig.getM3uUrl());
@@ -509,6 +693,22 @@ public class ConfigWebServer {
         config.addProperty("update_auto_check", AppConfig.isUpdateAutoCheckEnabled());
         config.addProperty("update_last_check_ms", AppConfig.getUpdateLastCheckMs());
         config.addProperty("update_last_error", AppConfig.getUpdateLastError());
+        // The playlists the app can fall back to, so the page can offer them instead of making
+        // the user go and find a URL to paste.
+        config.add("built_in_sources",
+                new com.google.gson.Gson().toJsonTree(appSourceList()));
+        config.add("built_in_source_labels",
+                new com.google.gson.Gson().toJsonTree(appSourceLabels()));
+        // Source probing and the segment cache: what the app has learned, and what it is costing.
+        config.addProperty("source_speed_enabled", AppConfig.isSourceSpeedEnabled());
+        config.addProperty("source_speed_known", SourceSpeedStore.size());
+        // WebConfig: the ceiling the cache will not grow past, and what it holds now.
+        config.addProperty("media_cache_enabled", AppConfig.isMediaCacheEnabled());
+        config.addProperty("media_cache_size_mb",
+                (int) (AppConfig.getMediaCacheMaxBytes() / (1024 * 1024)));
+        config.addProperty("media_cache_used_mb",
+                (int) (cacheBytes(appContext) / (1024 * 1024)));
+        config.addProperty("video_quality", AppConfig.getVideoQuality());
         addUpdateStateJson(config, UpdateManager.get().getStatus());
         return config.toString();
     }
@@ -946,6 +1146,45 @@ public class ConfigWebServer {
                 "        </div>\n" +
                 "        \n" +
                 "        <div class=\"section\">\n" +
+                "            <h2>直播源 / 测速 / 缓存</h2>\n" +
+                "            <label for=\"sourcePicker\">选择一个可用直播源:</label>\n" +
+                "            <select id=\"sourcePicker\" style=\"width:100%;padding:10px;margin-bottom:8px;background-color:#1a1a1a;color:#fff;border:1px solid #444;border-radius:4px;font-size:14px;\"></select>\n" +
+                "            <button onclick=\"useSelectedSource()\">使用此直播源</button>\n" +
+                "            <div id=\"sourceStatus\" class=\"status\"></div>\n" +
+                "            <div class=\"info\" style=\"margin-top:12px;\">电视会依次尝试这些源，前一个打不开就自动换下一个；打开画面后仍可用遥控器切换该频道的其它线路。</div>\n" +
+                "            <label style=\"display:flex;align-items:center;gap:8px;margin:16px 0 8px;\">\n" +
+                "                <input type=\"checkbox\" id=\"sourceSpeedEnabled\"> 自动测速选源（换台时自动挑能打开的线路）\n" +
+                "            </label>\n" +
+                "            <button onclick=\"remeasureSources()\">立即重新测速</button>\n" +
+                "            <div id=\"speedStatus\" class=\"status\"></div>\n" +
+                "            <div id=\"speedInfo\" class=\"info\"></div>\n" +
+                "            <label style=\"display:flex;align-items:center;gap:8px;margin:16px 0 8px;\">\n" +
+                "                <input type=\"checkbox\" id=\"mediaCacheEnabled\"> 开启时移缓存（把看过的片段缓存到电视，回看更快）\n" +
+                "            </label>\n" +
+                "            <label for=\"mediaCacheSize\">缓存上限:</label>\n" +
+                "            <select id=\"mediaCacheSize\" style=\"width:100%;padding:10px;margin-bottom:8px;background-color:#1a1a1a;color:#fff;border:1px solid #444;border-radius:4px;font-size:14px;\">\n" +
+                "                <option value=\"64\">64 MB</option>\n" +
+                "                <option value=\"128\">128 MB（默认）</option>\n" +
+                "                <option value=\"256\">256 MB</option>\n" +
+                "                <option value=\"512\">512 MB</option>\n" +
+                "            </select>\n" +
+                "            <button onclick=\"saveCache()\">保存缓存设置</button>\n" +
+                "            <button onclick=\"clearCache()\" style=\"margin-left:8px;\">清空缓存</button>\n" +
+                "            <div id=\"cacheStatus\" class=\"status\"></div>\n" +
+                "            <div id=\"cacheInfo\" class=\"info\"></div>\n" +
+                "            <div class=\"info\">缓存有上限，超出自动淘汰最旧的片段，不会无限增长；整段长流（非分片）不缓存。</div>\n" +
+                "            <label for=\"videoQuality\" style=\"margin-top:16px;\">清晰度上限:</label>\n" +
+                "            <select id=\"videoQuality\" style=\"width:100%;padding:10px;margin-bottom:8px;background-color:#1a1a1a;color:#fff;border:1px solid #444;border-radius:4px;font-size:14px;\">\n" +
+                "                <option value=\"0\">自动（自适应，取线路最佳）</option>\n" +
+                "                <option value=\"1\">最高 1080P</option>\n" +
+                "                <option value=\"2\">最高 720P</option>\n" +
+                "                <option value=\"3\">最高 480P</option>\n" +
+                "            </select>\n" +
+                "            <button onclick=\"saveQuality()\">保存清晰度</button>\n" +
+                "            <div id=\"qualityStatus\" class=\"status\"></div>\n" +
+                "        </div>\n" +
+                "        \n" +
+                "        <div class=\"section\">\n" +
                 "            <h2>关于 / 更新</h2>\n" +
                 "            <div id=\"appVersionInfo\" class=\"info\"></div>\n" +
                 "            <label style=\"display:flex;align-items:center;gap:8px;margin:12px 0;\">\n" +
@@ -1084,6 +1323,61 @@ public class ConfigWebServer {
                 "                document.getElementById('playbackStatus').textContent = '✗ 网络错误: ' + e;\n" +
                 "            });\n" +
                 "        }\n" +
+                "        function useSelectedSource() {\n" +
+                "            const url = document.getElementById('sourcePicker').value;\n" +
+                "            if (!url) { alert('请先选择一个直播源'); return; }\n" +
+                "            postForm('/config/m3u-url', 'm3u_url=' + encodeURIComponent(url)).then(d => {\n" +
+                "                const status = document.getElementById('sourceStatus');\n" +
+                "                status.className = 'status ' + (d.success ? 'success' : 'error');\n" +
+                "                status.textContent = (d.success ? '✓ ' : '✗ ') + d.message + (d.success ? '（电视端将自动重新加载）' : '');\n" +
+                "            });\n" +
+                "        }\n" +
+                "        function saveSourceSpeed() {\n" +
+                "            const body = 'source_speed_enabled=' + (document.getElementById('sourceSpeedEnabled').checked ? '1' : '0');\n" +
+                "            postForm('/config/source-speed', body).then(d => {\n" +
+                "                const status = document.getElementById('speedStatus');\n" +
+                "                status.className = 'status ' + (d.success ? 'success' : 'error');\n" +
+                "                status.textContent = (d.success ? '✓ ' : '✗ ') + d.message;\n" +
+                "            });\n" +
+                "        }\n" +
+                "        function remeasureSources() {\n" +
+                "            const status = document.getElementById('speedStatus');\n" +
+                "            status.className = 'status success';\n" +
+                "            status.textContent = '正在让电视重新测速…';\n" +
+                "            postForm('/config/source-remeasure', 'action=remeasure').then(d => {\n" +
+                "                status.className = 'status ' + (d.success ? 'success' : 'error');\n" +
+                "                status.textContent = (d.success ? '✓ ' : '✗ ') + d.message;\n" +
+                "                if (d.success) { setTimeout(loadConfig, 3000); }\n" +
+                "            });\n" +
+                "        }\n" +
+                "        function saveCache() {\n" +
+                "            const body = 'media_cache_enabled=' + (document.getElementById('mediaCacheEnabled').checked ? '1' : '0')\n" +
+                "                + '&media_cache_size_mb=' + encodeURIComponent(document.getElementById('mediaCacheSize').value);\n" +
+                "            postForm('/config/media-cache', body).then(d => {\n" +
+                "                const status = document.getElementById('cacheStatus');\n" +
+                "                status.className = 'status ' + (d.success ? 'success' : 'error');\n" +
+                "                status.textContent = (d.success ? '✓ ' : '✗ ') + d.message;\n" +
+                "            });\n" +
+                "        }\n" +
+                "        function clearCache() {\n" +
+                "            postForm('/config/media-cache-clear', 'action=clear').then(d => {\n" +
+                "                const status = document.getElementById('cacheStatus');\n" +
+                "                status.className = 'status ' + (d.success ? 'success' : 'error');\n" +
+                "                status.textContent = (d.success ? '✓ ' : '✗ ') + d.message;\n" +
+                "                if (d.success) { loadConfig(); }\n" +
+                "            });\n" +
+                "        }\n" +
+                "        function saveQuality() {\n" +
+                "            const body = 'video_quality=' + encodeURIComponent(document.getElementById('videoQuality').value);\n" +
+                "            postForm('/config/quality', body).then(d => {\n" +
+                "                const status = document.getElementById('qualityStatus');\n" +
+                "                status.className = 'status ' + (d.success ? 'success' : 'error');\n" +
+                "                status.textContent = (d.success ? '✓ ' : '✗ ') + d.message;\n" +
+                "            });\n" +
+                "        }\n" +
+                "        function postForm(path, body) {\n" +
+                "            return fetch(path, {method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: body}).then(r => r.json());\n" +
+                "        }\n" +
                 "        function saveUpdateSettings() {\n" +
                 "            const body = 'update_auto_check=' + (document.getElementById('updateAutoCheck').checked ? '1' : '0');\n" +
                 "            fetch('/config/update-settings', {method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: body})\n" +
@@ -1161,8 +1455,8 @@ public class ConfigWebServer {
                 "                }\n" +
                 "            }).catch(e => console.error('轮询更新状态失败:', e));\n" +
                 "        }\n" +
-                "        window.onload = function() {\n" +
-                "            fetch('/config/get').then(r => r.json()).then(d => {\n" +
+                "        function loadConfig() {\n" +
+                "            return fetch('/config/get').then(r => r.json()).then(d => {\n" +
                 "                document.getElementById('m3uUrl').value = d.m3u_url || '';\n" +
                 "                document.getElementById('epgUrl').value = d.epg_url || '';\n" +
                 "                document.getElementById('epgPreference').value = d.epg_preference || 'auto';\n" +
@@ -1191,10 +1485,35 @@ public class ConfigWebServer {
                 "                    ? '当前生效 EPG: ' + active\n" +
                 "                    : '当前无生效 EPG 来源';\n" +
                 "                document.getElementById('updateAutoCheck').checked = d.update_auto_check !== false;\n" +
+                "                renderSourceSection(d);\n" +
                 "                renderUpdate(d);\n" +
-                "            }).catch(e => console.error('加载配置失败:', e));\n" +
+                "            });\n" +
+                "        }\n" +
+                "        function renderSourceSection(d) {\n" +
+                "            const picker = document.getElementById('sourcePicker');\n" +
+                "            const sources = d.built_in_sources || [];\n" +
+                "            picker.innerHTML = '';\n" +
+                "            const labels = d.built_in_source_labels || {};\n" +
+                "            sources.forEach(url => {\n" +
+                "                const option = document.createElement('option');\n" +
+                "                option.value = url;\n" +
+                "                option.textContent = labels[url] ? (labels[url] + ' — ' + url) : url;\n" +
+                "                picker.appendChild(option);\n" +
+                "            });\n" +
+                "            if (d.m3u_url) { picker.value = d.m3u_url; }\n" +
+                "            document.getElementById('sourceSpeedEnabled').checked = d.source_speed_enabled !== false;\n" +
+                "            document.getElementById('speedInfo').textContent = '已测速线路数: ' + (d.source_speed_known || 0);\n" +
+                "            document.getElementById('mediaCacheEnabled').checked = !!d.media_cache_enabled;\n" +
+                "            if (d.media_cache_size_mb) { document.getElementById('mediaCacheSize').value = String(d.media_cache_size_mb); }\n" +
+                "            document.getElementById('cacheInfo').textContent = d.media_cache_enabled ? ('已用 ' + (d.media_cache_used_mb || 0) + ' MB / 上限 ' + (d.media_cache_size_mb || 0) + ' MB') : '时移缓存未开启';\n" +
+                "            document.getElementById('videoQuality').value = String(d.video_quality == null ? 0 : d.video_quality);\n" +
+                "        }\n" +
+                "        window.onload = function() {\n" +
+                "            loadConfig().catch(e => console.error('加载配置失败:', e));\n" +
                 "        };\n" +
                 "        document.getElementById('updateAutoCheck').addEventListener('change', saveUpdateSettings);\n" +
+                "        document.getElementById('sourceSpeedEnabled').addEventListener('change', saveSourceSpeed);\n" +
+                "        document.getElementById('videoQuality').addEventListener('change', saveQuality);\n" +
                 "    </script>\n" +
                 "</body>\n" +
                 "</html>";

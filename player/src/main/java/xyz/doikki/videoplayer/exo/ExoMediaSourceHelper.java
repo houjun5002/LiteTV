@@ -29,10 +29,19 @@ public final class ExoMediaSourceHelper {
 
     private static ExoMediaSourceHelper sInstance;
 
+    /**
+     * Default ceiling for the segment cache. Small on purpose: this is a television box, where
+     * storage is the one thing the viewer is not meant to have to think about, and a cache that
+     * grows on its own is a complaint waiting to happen.
+     */
+    public static final long DEFAULT_CACHE_MAX_BYTES = 128 * 1024 * 1024;
+
     private final Context mAppContext;
     private OkHttpDataSource.Factory mHttpDataSourceFactory;
     private Cache mCache;
     private OkHttpClient mClient;
+    private volatile boolean mCacheEnabled;
+    private volatile long mCacheMaxBytes = DEFAULT_CACHE_MAX_BYTES;
 
     private ExoMediaSourceHelper(Context context) {
         mAppContext = context.getApplicationContext();
@@ -74,10 +83,81 @@ public final class ExoMediaSourceHelper {
         return getMediaSource(uri, headers, false, C.TYPE_HLS);
     }
 
+    /**
+     * Turns the segment cache on or off. Nothing is deleted by turning it off; the space is
+     * reclaimed when the entries age out or {@link #clearCache()} is called.
+     */
+    public void setCacheEnabled(boolean enabled) {
+        mCacheEnabled = enabled;
+    }
+
+    /**
+     * Resizes the segment cache. The old one is released rather than merged, so the ceiling
+     * actually drops when the viewer asks for a smaller one.
+     */
+    public void setCacheMaxBytes(long bytes) {
+        long target = bytes <= 0 ? 0 : bytes;
+        if (target == mCacheMaxBytes) {
+            return;
+        }
+        synchronized (this) {
+            mCacheMaxBytes = target;
+            if (mCache != null) {
+                try {
+                    mCache.release();
+                } catch (Exception ignored) {
+                    // The cache is being replaced; nothing to do if it was already gone.
+                }
+                mCache = null;
+            }
+        }
+    }
+
+    /** Empties the segment cache and releases it. */
+    public void clearCache() {
+        synchronized (this) {
+            if (mCache != null) {
+                try {
+                    mCache.release();
+                } catch (Exception ignored) {
+                    // Already released.
+                }
+                mCache = null;
+            }
+        }
+        deleteDir(cacheDir());
+    }
+
+    /**
+     * What the cache is holding, for a settings screen that shows what it is costing. Walks the
+     * cache's own index, so it counts the same bytes the evictor does.
+     */
+    public long getCacheBytes() {
+        Cache cache;
+        synchronized (this) {
+            if (mCache == null) {
+                if (!mCacheEnabled) {
+                    return 0;
+                }
+                mCache = newCache();
+            }
+            cache = mCache;
+        }
+        return cache.getCacheSpace();
+    }
+
+    /** Only segmented sources can be cached a piece at a time and reused. */
+    private static boolean isSegmentable(int contentType) {
+        return contentType == C.TYPE_HLS || contentType == C.TYPE_DASH;
+    }
+
     private MediaSource getMediaSource(String uri, Map<String, String> headers, boolean isCache, int contentType) {
         Uri contentUri = Uri.parse(uri);
+        // An endless progressive stream has no segments to reuse: caching it would just keep
+        // appending the same broadcast until the disk was full. Only segmented sources benefit.
+        boolean useCache = isCache || (mCacheEnabled && isSegmentable(contentType));
         DataSource.Factory factory;
-        if (isCache) {
+        if (useCache) {
             factory = getCacheDataSourceFactory();
         } else {
             factory = getDataSourceFactory();
@@ -143,29 +223,49 @@ public final class ExoMediaSourceHelper {
     }
 
     private DataSource.Factory getCacheDataSourceFactory() {
-        if (mCache == null) {
-            mCache = newCache();
-        }
+        newCache();
         return new CacheDataSource.Factory()
                 .setCache(mCache)
                 .setUpstreamDataSourceFactory(getDataSourceFactory())
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR);
     }
 
-    private Cache newCache() {
-        return new SimpleCache(
-                new File(externalCacheDir(), "exo-video-cache"),//缓存目录
-                new LeastRecentlyUsedCacheEvictor(512 * 1024 * 1024),//缓存大小，默认512M，使用LRU算法实现
+    private synchronized Cache newCache() {
+        if (mCache != null) {
+            return mCache;
+        }
+        mCache = new SimpleCache(
+                cacheDir(),
+                // Least-recently-used eviction is what keeps the promise that the cache is
+                // bounded: entries past the ceiling go, and what is being watched now stays.
+                new LeastRecentlyUsedCacheEvictor(mCacheMaxBytes),
                 new ExoDatabaseProvider(mAppContext));
+        return mCache;
     }
 
-    private File externalCacheDir()
-    {
+    private File cacheDir() {
         File externalCacheDir = mAppContext.getExternalCacheDir();
-        if (externalCacheDir == null){
-            externalCacheDir = mAppContext.getCacheDir();
+        File base = externalCacheDir != null ? externalCacheDir : mAppContext.getCacheDir();
+        return new File(base, "exo-video-cache");
+    }
+
+    private static void deleteDir(File dir) {
+        if (dir == null || !dir.exists()) {
+            return;
         }
-        return externalCacheDir;
+        File[] files = dir.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                if (file.isDirectory()) {
+                    deleteDir(file);
+                } else {
+                    //noinspection ResultOfMethodCallIgnored
+                    file.delete();
+                }
+            }
+        }
+        //noinspection ResultOfMethodCallIgnored
+        dir.delete();
     }
     /**
      * Returns a new DataSource factory.

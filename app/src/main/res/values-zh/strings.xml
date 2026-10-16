@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">LiteTV</string>
+    <string name="app_name">中天LiteTV</string>
     <string name="channel_list">频道列表</string>
     <string name="settings">设置</string>
     <string name="web_server">Web 服务器</string>

@@ -8,6 +8,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import xyz.doikki.videoplayer.exo.ExoMediaSourceHelper;
+import xyz.doikki.videoplayer.player.VideoView;
 import xyz.doikki.videoplayer.player.VideoViewConfig;
 
 public class AppConfig {
@@ -17,6 +19,7 @@ public class AppConfig {
     private static final String WEB_SERVER_PORT_KEY = "app_web_server_port";
     private static final String SIDEBAR_OPACITY_KEY = "app_sidebar_opacity";
     private static final String M3U_FILE_PATH_KEY = "app_m3u_file_path";
+    private static final String M3U_SOURCE_SEEDED_KEY = "app_m3u_source_seeded";
     private static final String EPG_DISPLAY_KEY = "app_epg_display_enabled";
     private static final String EPG_CACHE_VALIDITY_HOURS_KEY = "app_epg_cache_hours";
     private static final String LAST_CHANNEL_URL_KEY = "app_last_channel_url";
@@ -31,6 +34,11 @@ public class AppConfig {
     private static final String UPDATE_LAST_ERROR_KEY = "app_update_last_error";
     private static final String UPDATE_PENDING_VERSION_KEY = "app_update_pending_version";
     private static final String UPDATE_PENDING_NAME_KEY = "app_update_pending_name";
+    private static final String SCREEN_SCALE_TYPE_KEY = "app_screen_scale_type";
+    private static final String SOURCE_SPEED_ENABLED_KEY = "app_source_speed_enabled";
+    private static final String MEDIA_CACHE_ENABLED_KEY = "app_media_cache_enabled";
+    private static final String MEDIA_CACHE_MAX_BYTES_KEY = "app_media_cache_max_bytes";
+    private static final String VIDEO_QUALITY_KEY = "app_video_quality";
 
     private static final String DEFAULT_EPG_URL = "";
     /**
@@ -52,6 +60,86 @@ public class AppConfig {
 
     public static void setM3uUrl(String url) {
         Hawk.put(M3U_URL_KEY, url);
+    }
+
+    /**
+     * Gives a fresh install a playlist to start from, so the remote shows live TV on first
+     * launch instead of an empty screen.
+     *
+     * It runs once per install, not once per launch: whatever the user sets afterwards is theirs
+     * to keep, and clearing the URL stays clearing it. An upgrade from a version that already
+     * had a source keeps that one.
+     */
+    public static void seedBuiltInSourceIfNeeded() {
+        if (Hawk.get(M3U_SOURCE_SEEDED_KEY, false)) {
+            return;
+        }
+        Hawk.put(M3U_SOURCE_SEEDED_KEY, true);
+        String current = getM3uUrl();
+        if (current != null && !current.isEmpty()) {
+            return;
+        }
+        setM3uUrl(BuiltInSources.primary());
+    }
+
+    /**
+     * How the picture is fitted to the screen.
+     *
+     * <p>Defaults to stretching to fill. A television is watched from across the room on a screen
+     * whose shape is known, and these streams are rarely that shape: a station still sending 4:3
+     * would otherwise sit in a box with black bars down both sides, which is what "not full
+     * screen" looks like to anyone who has not gone looking for a setting. The other fits are one
+     * button away for anyone who would rather keep the shape.
+     */
+    public static int getScreenScaleType() {
+        return Hawk.get(SCREEN_SCALE_TYPE_KEY, VideoView.SCREEN_SCALE_MATCH_PARENT);
+    }
+
+    public static void setScreenScaleType(int scaleType) {
+        Hawk.put(SCREEN_SCALE_TYPE_KEY, scaleType);
+    }
+
+    /** Automatic source probing can be turned off; stored results stay usable either way. */
+    public static boolean isSourceSpeedEnabled() {
+        return Hawk.get(SOURCE_SPEED_ENABLED_KEY, true);
+    }
+
+    public static void setSourceSpeedEnabled(boolean enabled) {
+        Hawk.put(SOURCE_SPEED_ENABLED_KEY, enabled);
+    }
+
+    /**
+     * Caching of stream segments to disk.
+     *
+     * <p>It is what makes rewind and re-seek instant, and it is off by default. The ceiling is a
+     * promise, not a suggestion: the cache evicts least-recently-used, so it cannot creep past
+     * what the viewer allowed. Live streams that are one endless byte stream rather than segments
+     * are never cached, because there is nothing to reuse and it would fill the disk.
+     */
+    public static boolean isMediaCacheEnabled() {
+        return Hawk.get(MEDIA_CACHE_ENABLED_KEY, false);
+    }
+
+    public static void setMediaCacheEnabled(boolean enabled) {
+        Hawk.put(MEDIA_CACHE_ENABLED_KEY, enabled);
+    }
+
+    /** Ceiling for the segment cache in bytes, or 0 for off. */
+    public static long getMediaCacheMaxBytes() {
+        return Hawk.get(MEDIA_CACHE_MAX_BYTES_KEY, ExoMediaSourceHelper.DEFAULT_CACHE_MAX_BYTES);
+    }
+
+    public static void setMediaCacheMaxBytes(long bytes) {
+        Hawk.put(MEDIA_CACHE_MAX_BYTES_KEY, bytes);
+    }
+
+    /** The chosen picture quality, as a {@link VideoQuality} tier. */
+    public static int getVideoQuality() {
+        return Hawk.get(VIDEO_QUALITY_KEY, VideoQuality.TIER_AUTO);
+    }
+
+    public static void setVideoQuality(int tier) {
+        Hawk.put(VIDEO_QUALITY_KEY, tier);
     }
 
     // EPG URL

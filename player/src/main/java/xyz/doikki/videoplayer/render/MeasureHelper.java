@@ -73,8 +73,9 @@ public class MeasureHelper {
                 }
                 break;
             case VideoView.SCREEN_SCALE_MATCH_PARENT:
-                width = widthMeasureSpec;
-                height = heightMeasureSpec;
+                // Stretch to fill the container. width and height already hold the container
+                // size from getSize() above; assigning the raw spec passed the mode bits along
+                // with the size, which measured the view to a size in the millions.
                 break;
             case VideoView.SCREEN_SCALE_CENTER_CROP:
                 if (mVideoWidth * height > width * mVideoHeight) {

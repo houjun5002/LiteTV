@@ -75,6 +75,14 @@ public class ChannelListComponent extends FrameLayout implements IControlCompone
     private java.util.List<Integer> mAvailableDayOffsets = new ArrayList<>();
     private OnChannelSelectedListener mSelectionListener;
     private OnProgramClickListener mProgramClickListener;
+    private OnSettingsRequestedListener mSettingsListener;
+    private TextView mSearchView;
+    /** What the viewer has typed; empty means the group's normal list is shown. */
+    private String mSearchQuery = "";
+    /** True while keys are being treated as search input rather than as navigation. */
+    private boolean mSearchActive = false;
+    /** The result rows currently shown while searching, as flat playlist indices. */
+    private List<Integer> mSearchResults = new ArrayList<>();
     private EpgManager mEpgManager;
     private boolean mProgramListVisible = false;
     private static final String TAG = "ChannelListComponent";
@@ -95,6 +103,11 @@ public class ChannelListComponent extends FrameLayout implements IControlCompone
     /** Fired when the user taps a programme row (回看). */
     public interface OnProgramClickListener {
         void onProgramClick(Channel channel, EpgManager.Program program);
+    }
+
+    /** Fired when the settings gear (or a long press on the header) is used. */
+    public interface OnSettingsRequestedListener {
+        void onSettingsRequested();
     }
 
     public ChannelListComponent(@NonNull Context context, ChannelNavigator navigator) {
@@ -160,8 +173,69 @@ public class ChannelListComponent extends FrameLayout implements IControlCompone
         mTitleView.setPadding(dp2px(12), dp2px(12), dp2px(12), dp2px(12));
         mTitleView.setSingleLine();
         mTitleView.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        mTitleView.setLayoutParams(new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        channelSection.addView(mTitleView);
+        mTitleView.setLayoutParams(new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
+        // Holding the header opens the settings. MENU leads here rather than straight into the
+        // form, so this is the way back to it; a long press is not discoverable on its own, which
+        // is why the gear sits next to the title as well.
+        mTitleView.setLongClickable(true);
+        mTitleView.setOnLongClickListener(v -> {
+            if (mSettingsListener != null) {
+                mSettingsListener.onSettingsRequested();
+                return true;
+            }
+            return false;
+        });
+
+        LinearLayout headerRow = new LinearLayout(context);
+        headerRow.setOrientation(LinearLayout.HORIZONTAL);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        headerRow.setLayoutParams(new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        headerRow.addView(mTitleView);
+
+        TextView settingsButton = new TextView(context);
+        settingsButton.setText("\u2699");
+        settingsButton.setTextColor(0xFFB8C4D0);
+        settingsButton.setTextSize(20);
+        settingsButton.setPadding(dp2px(12), dp2px(10), dp2px(14), dp2px(10));
+        settingsButton.setFocusable(true);
+        settingsButton.setClickable(true);
+        settingsButton.setOnClickListener(v -> {
+            if (mSettingsListener != null) {
+                mSettingsListener.onSettingsRequested();
+            }
+        });
+        headerRow.addView(settingsButton);
+
+        TextView searchButton = new TextView(context);
+        searchButton.setText("\uD83D\uDD0D");
+        searchButton.setTextColor(0xFFB8C4D0);
+        searchButton.setTextSize(17);
+        searchButton.setPadding(dp2px(12), dp2px(10), dp2px(14), dp2px(10));
+        searchButton.setFocusable(true);
+        searchButton.setClickable(true);
+        searchButton.setOnClickListener(v -> requestSearch());
+        headerRow.addView(searchButton);
+
+        channelSection.addView(headerRow);
+
+        // Search box. Typing is done with the remote's own keys (MainActivity routes them here
+        // while this has focus), because a television has no keyboard worth the name; the field
+        // is read-only to touch so the two cannot disagree.
+        mSearchView = new TextView(context);
+        mSearchView.setTextColor(0xFFE6EDF3);
+        mSearchView.setTextSize(14);
+        mSearchView.setSingleLine();
+        mSearchView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        mSearchView.setPadding(dp2px(12), dp2px(8), dp2px(12), dp2px(8));
+        mSearchView.setBackgroundColor(0x33FFFFFF);
+        mSearchView.setFocusable(false);
+        mSearchView.setOnClickListener(v -> requestSearch());
+        LinearLayout.LayoutParams searchParams = new LinearLayout.LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
+        searchParams.setMargins(dp2px(10), 0, dp2px(10), dp2px(6));
+        mSearchView.setLayoutParams(searchParams);
+        mSearchView.setVisibility(GONE);
+        channelSection.addView(mSearchView);
 
         mRecyclerView = new RecyclerView(context);
         mRecyclerView.setLayoutParams(new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT, 1.0f));
@@ -270,6 +344,10 @@ public class ChannelListComponent extends FrameLayout implements IControlCompone
         mProgramClickListener = listener;
     }
 
+    public void setOnSettingsRequestedListener(OnSettingsRequestedListener listener) {
+        mSettingsListener = listener;
+    }
+
     /** Touch tap on a group row: open that group, the way OK does on the groups column. */
     private void onGroupRowTap(int position) {
         if (position < 0 || position >= mNavigator.groupCount()) {
@@ -328,6 +406,13 @@ public class ChannelListComponent extends FrameLayout implements IControlCompone
             }
         }
         mBrowsedGroup = groupIndex;
+        // Opening a group is a statement that the viewer wants the group, not their last search.
+        mSearchActive = false;
+        mSearchQuery = "";
+        mSearchResults = new ArrayList<>();
+        if (mSearchView != null) {
+            mSearchView.setVisibility(GONE);
+        }
         mChannels = mNavigator.channelsOf(groupIndex);
         mVisibleIndices = new ArrayList<>(group.channels);
         mTitleView.setText(groupLabel(getContext(), group));
@@ -352,6 +437,123 @@ public class ChannelListComponent extends FrameLayout implements IControlCompone
             scrollToCentered(mRecyclerView, position, CHANNEL_ROW_HEIGHT_DP);
             loadAndShowPrograms();
         }
+    }
+
+    // ---- search --------------------------------------------------------------------------
+
+    /** Whether keys should be treated as search input rather than as navigation. */
+    public boolean isSearchActive() {
+        return mSearchActive;
+    }
+
+    /**
+     * Opens the search box and focuses it.
+     *
+     * <p>Search looks across every group rather than the one being browsed: a viewer who types a
+     * channel name is saying "I know what I want, take me to it", and making them first work out
+     * which group it is in would defeat the point.
+     */
+    public void requestSearch() {
+        mSearchActive = true;
+        mSearchQuery = "";
+        mSearchView.setVisibility(VISIBLE);
+        // The programme column belongs to the channel that was highlighted; while searching there
+        // is no such channel yet.
+        hideProgramList();
+        applySearch();
+    }
+
+    /** Closes the search and restores the group's own list. */
+    public void closeSearch() {
+        if (!mSearchActive && mSearchQuery.isEmpty()) {
+            return;
+        }
+        mSearchActive = false;
+        mSearchQuery = "";
+        mSearchResults = new ArrayList<>();
+        mSearchView.setVisibility(GONE);
+        showGroup(mBrowsedGroup, mCurrentChannelIndex);
+    }
+
+    /**
+     * Feeds one typed character into the search.
+     *
+     * @return true when the character was consumed
+     */
+    public boolean appendSearchCharacter(char c) {
+        if (!mSearchActive) {
+            return false;
+        }
+        mSearchQuery = mSearchQuery + c;
+        applySearch();
+        return true;
+    }
+
+    /** Removes the last typed character, closing the search when none is left. */
+    public boolean deleteSearchCharacter() {
+        if (!mSearchActive) {
+            return false;
+        }
+        if (mSearchQuery.isEmpty()) {
+            closeSearch();
+            return true;
+        }
+        mSearchQuery = mSearchQuery.substring(0, mSearchQuery.length() - 1);
+        applySearch();
+        return true;
+    }
+
+    public String getSearchQuery() {
+        return mSearchQuery;
+    }
+
+    /**
+     * Recomputes the result list and shows it.
+     *
+     * <p>The rows are the same channel rows the group list uses - the same adapter, the same row
+     * height, the same highlight - so searching feels like the list narrowing rather than like
+     * arriving somewhere else.
+     */
+    private void applySearch() {
+        String needle = mSearchQuery.trim();
+        mSearchResults = needle.isEmpty()
+                ? new ArrayList<>()
+                : mNavigator.search(needle);
+        mChannels = mNavigator.channelsOf(mSearchResults);
+        mVisibleIndices = new ArrayList<>(mSearchResults);
+        mTitleView.setText(getContext().getString(
+                R.string.search_results, mSearchResults.size()));
+        mSearchView.setText(getContext().getString(R.string.search_prompt, mSearchQuery));
+
+        boolean empty = mSearchResults.isEmpty();
+        mSelectedChannelIndex = empty ? -1 : mSearchResults.get(0);
+        mAdapter.updateData(mChannels, mVisibleIndices,
+                mVisibleIndices.indexOf(mCurrentChannelIndex), empty ? -1 : 0);
+        mEmptyView.setText(R.string.search_no_results);
+        mEmptyView.setVisibility(empty ? VISIBLE : GONE);
+        mRecyclerView.setVisibility(empty ? GONE : VISIBLE);
+        if (!empty) {
+            scrollToCentered(mRecyclerView, 0, CHANNEL_ROW_HEIGHT_DP);
+        }
+    }
+
+    /** Moves the highlight inside the search results, without wrapping past the ends. */
+    public void moveSearchSelection(boolean down) {
+        if (mSearchResults.isEmpty()) {
+            return;
+        }
+        int position = mVisibleIndices.indexOf(mSelectedChannelIndex);
+        if (position < 0) {
+            position = 0;
+        }
+        int next = position + (down ? 1 : -1);
+        if (next < 0 || next >= mSearchResults.size()) {
+            return;
+        }
+        mSelectedChannelIndex = mSearchResults.get(next);
+        mAdapter.updateData(mChannels, mVisibleIndices,
+                mVisibleIndices.indexOf(mCurrentChannelIndex), next);
+        scrollToCentered(mRecyclerView, next, CHANNEL_ROW_HEIGHT_DP);
     }
 
     /** Moves the group highlight, wrapping at the ends, and lists the group it lands on. */

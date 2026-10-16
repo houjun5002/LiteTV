@@ -20,7 +20,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.cabletv.player.R;
+import com.cabletv.player.About;
 import com.cabletv.player.config.AppConfig;
+import com.cabletv.player.config.BuiltInSources;
 import com.cabletv.player.server.ConfigWebServer;
 import com.cabletv.player.update.ApkInstaller;
 import com.cabletv.player.update.AppVersion;
@@ -102,6 +104,7 @@ public class SettingsActivity extends Activity implements UpdateManager.Listener
         mUpdateActionButton = findViewById(R.id.check_update_btn);
 
         Button saveM3uBtn = findViewById(R.id.save_m3u_btn);
+        Button pickBuiltinSourceBtn = findViewById(R.id.pick_builtin_source_btn);
         Button saveEpgBtn = findViewById(R.id.save_epg_btn);
         Button pickM3uFileBtn = findViewById(R.id.pick_m3u_file_btn);
         Button scanM3uFileBtn = findViewById(R.id.scan_m3u_file_btn);
@@ -122,6 +125,9 @@ public class SettingsActivity extends Activity implements UpdateManager.Listener
 
         // Setup listeners
         saveM3uBtn.setOnClickListener(v -> saveM3uUrl());
+        if (pickBuiltinSourceBtn != null) {
+            pickBuiltinSourceBtn.setOnClickListener(v -> showBuiltInSourcePicker());
+        }
         saveEpgBtn.setOnClickListener(v -> saveEpgUrl());
         pickM3uFileBtn.setOnClickListener(v -> pickM3uFile());
         scanM3uFileBtn.setOnClickListener(v -> showFolderImportDialog());
@@ -270,10 +276,43 @@ public class SettingsActivity extends Activity implements UpdateManager.Listener
                 AppVersion.name(this), AppVersion.code(this)));
         mUpdateAutoCheckToggle.setChecked(AppConfig.isUpdateAutoCheckEnabled());
         renderUpdateStatus();
+        renderAbout();
         updateM3uEpgInfo();
         updateM3uFileInfo();
         updateM3uDropDirText();
         updateWebServerAddress();
+    }
+
+    /**
+     * Fills in the about section: where the project lives, what it is licensed under, and which
+     * upstream projects the channel data comes from.
+     *
+     * <p>Selecting the address copies it, because a link that cannot be clicked from a television
+     * is only useful if the viewer can carry it somewhere else.
+     */
+    private void renderAbout() {
+        TextView sourceUrl = findViewById(R.id.about_source_url);
+        if (sourceUrl != null) {
+            sourceUrl.setText(getString(R.string.about_source, About.SOURCE_URL));
+            sourceUrl.setOnClickListener(v -> {
+                android.content.ClipboardManager clipboard =
+                        (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                if (clipboard != null) {
+                    clipboard.setPrimaryClip(
+                            android.content.ClipData.newPlainText("LiteTV", About.SOURCE_URL));
+                    Toast.makeText(this, R.string.about_url_copied, Toast.LENGTH_SHORT).show();
+                }
+            });
+        }
+        TextView license = findViewById(R.id.about_license_text);
+        if (license != null) {
+            StringBuilder text = new StringBuilder(
+                    getString(R.string.about_license, About.LICENSE_NAME));
+            for (String dataSource : About.dataSources()) {
+                text.append("\n\n").append(dataSource);
+            }
+            license.setText(text.toString());
+        }
     }
 
     /**
@@ -799,6 +838,36 @@ public class SettingsActivity extends Activity implements UpdateManager.Listener
         String url = mM3uUrlInput.getText().toString().trim();
         AppConfig.setM3uUrl(url);
         Toast.makeText(this, R.string.m3u_url_saved, Toast.LENGTH_SHORT).show();
+    }
+
+    /**
+     * Offers the playlists the app ships with, so a viewer whose current source has gone dark can
+     * switch without typing a URL on a remote control - which is not a thing anyone wants to do.
+     *
+     * <p>Choosing one writes it into the M3U URL field, so it is visible exactly as if it had been
+     * typed: there is one setting, not a hidden override.
+     */
+    private void showBuiltInSourcePicker() {
+        java.util.List<BuiltInSources.Source> sources = BuiltInSources.all();
+        final String[] labels = new String[sources.size()];
+        for (int i = 0; i < sources.size(); i++) {
+            BuiltInSources.Source source = sources.get(i);
+            labels[i] = source.label + "\n" + source.url;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.pick_builtin_source_title)
+                .setItems(labels, (dialog, which) -> {
+                    BuiltInSources.Source chosen = sources.get(which);
+                    AppConfig.setM3uUrl(chosen.url);
+                    if (mM3uUrlInput != null) {
+                        mM3uUrlInput.setText(chosen.url);
+                    }
+                    Toast.makeText(this,
+                            getString(R.string.builtin_source_selected, chosen.label),
+                            Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton(R.string.exit_cancel, null)
+                .show();
     }
 
     private void saveEpgUrl() {
