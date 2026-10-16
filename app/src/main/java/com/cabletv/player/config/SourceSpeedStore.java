@@ -133,6 +133,28 @@ public final class SourceSpeedStore {
     private static final int UNUSABLE_MS = Integer.MAX_VALUE - 1;
 
     /**
+     * The latency on record for a source, or null when the source is unknown or was rejected.
+     *
+     * <p>Returns null for the unusable marker rather than the marker itself, because callers are
+     * asking "do we have reason to trust this source", and "we know it is broken" is not a yes.
+     *
+     * @param url the source to look up
+     * @return the recorded latency in milliseconds, or null when there is nothing usable on record
+     */
+    public static synchronized Integer rememberedLatency(String url) {
+        if (url == null || url.isEmpty()) {
+            return null;
+        }
+        // Loading already drops records past their expiry, so what is in the maps is current.
+        ensureLoaded();
+        Integer ms = sLatency.get(url);
+        if (ms == null || ms == UNUSABLE_MS) {
+            return null;
+        }
+        return ms;
+    }
+
+    /**
      * Records a source as unusable.
      *
      * <p>It is kept rather than deleted, which looks backwards but is not: the background prober

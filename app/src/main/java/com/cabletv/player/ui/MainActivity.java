@@ -288,6 +288,20 @@ public class MainActivity extends Activity {
                     mCurrentChannelIndex = mChannelRepository.getCurrentChannelIndex(remembered);
                     Log.d(TAG, "Initial load: restoring channel for url=" + remembered
                             + ", index=" + mCurrentChannelIndex);
+                    if (remembered == null || remembered.isEmpty()) {
+                        // Nothing to restore: a first launch. The list's first entry is not a
+                        // good default, because the playlists order their channels by number
+                        // rather than by whether the streams work, and the streams at the top are
+                        // as likely to be dead as any other. Opening on a channel whose sources
+                        // are known to play is what keeps the first thing a viewer ever sees from
+                        // being a black screen.
+                        int playable = mChannelRepository.firstChannelWithKnownSource();
+                        if (playable >= 0) {
+                            mCurrentChannelIndex = playable;
+                            Log.i(TAG, "First launch: opening on channel index " + playable
+                                    + " because its sources are known to work");
+                        }
+                    }
                 } else {
                     // A refresh must not change the channel. Resetting to the first entry is only
                     // right when nothing is playing yet, which is the case when the cached

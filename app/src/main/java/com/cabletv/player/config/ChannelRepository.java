@@ -35,6 +35,52 @@ public class ChannelRepository {
     private static final String CACHE_SOURCE_FILE = "playlist.m3u.source";
     /** The handful of channels bundled with the app, for a first launch that has no cache yet. */
     private static final String SEED_PLAYLIST = "seed_playlist.m3u";
+
+    /**
+     * The channel a launch with nothing remembered opens on.
+     *
+     * <p>CCTV2 rather than CCTV1, which is where a playlist normally starts: its sources were
+     * verified by fetching real video data, and it is the channel most reliably available across
+     * the public sources this app ships with. Opening on a channel that plays is worth more than
+     * opening on the lowest number.
+     */
+    private static final String OPENING_CHANNEL = "CCTV2";
+
+    /**
+     * The index of a channel by name, or -1.
+     *
+     * <p>Compared with separators and case ignored, because the playlists are inconsistent about
+     * both: CCTV2 and CCTV-2 are the same station.
+     */
+    private int indexOfChannel(String name) {
+        List<Channel> channels = mFlatChannels;
+        if (name == null || channels == null) {
+            return -1;
+        }
+        String wanted = normalizeChannelName(name);
+        for (int i = 0; i < channels.size(); i++) {
+            Channel channel = channels.get(i);
+            if (channel != null && wanted.equals(normalizeChannelName(channel.name))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static String normalizeChannelName(String name) {
+        if (name == null) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder(name.length());
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c == '-' || c == '_' || c == ' ' || c == '\u3000') {
+                continue;
+            }
+            out.append(Character.toUpperCase(c));
+        }
+        return out.toString();
+    }
     /**
      * How long to wait for a playlist to answer.
      *
@@ -104,6 +150,49 @@ public class ChannelRepository {
     public void clearListeners() {
         mListeners.clear();
         mLoadFailedListener = null;
+    }
+
+    /**
+     * The first channel whose sources are all known to work, or -1 when nothing is known.
+     *
+     * <p>Used to pick what a first launch opens on. The ordering of the playlist reflects channel
+     * numbers, not whether the streams behind them answer, so "first" is an arbitrary choice that
+     * has nothing to do with what will play. A channel with at least one measured source is a
+     * far better bet, and the measurement is what makes it a bet worth taking.
+     *
+     * @return a flat channel index, or -1 when no channel has a usable source on record
+     */
+    public int firstChannelWithKnownSource() {
+        List<Channel> channels = mFlatChannels;
+        if (channels == null || channels.isEmpty()) {
+            return -1;
+        }
+        SourceSpeedTester.applyOrder(channels);
+        for (int i = 0; i < channels.size(); i++) {
+            Channel channel = channels.get(i);
+            if (channel != null && SourceSpeedTester.hasKnownWorkingSource(channel)) {
+                return i;
+            }
+        }
+        // Nothing measured: prefer the channel the bundled list opens on. It is checked by
+        // segment before shipping, so it is the only source on a fresh install with evidence
+        // behind it.
+        int preferred = indexOfChannel(OPENING_CHANNEL);
+        if (preferred >= 0 && channels.get(preferred).urlCount() > 0) {
+            return preferred;
+        }
+        if (mSeedPublished) {
+            // The bundled channels have no measurements yet - they have never been probed - but
+            // their sources were verified by fetching actual video data before being shipped, so
+            // they are known to work in the only sense that matters. Without this a first launch
+            // would ignore the one list on the device that is guaranteed to play.
+            for (int i = 0; i < channels.size(); i++) {
+                if (channels.get(i) != null && channels.get(i).urlCount() > 0) {
+                    return i;
+                }
+            }
+        }
+        return -1;
     }
 
     public void reload() {

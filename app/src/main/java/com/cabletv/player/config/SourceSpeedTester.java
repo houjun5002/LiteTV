@@ -273,6 +273,25 @@ public final class SourceSpeedTester {
         return targets;
     }
 
+    /**
+     * Whether a channel has a source that is known to work.
+     *
+     * <p>"Known to work" means a recorded measurement that is not the unusable marker: a source
+     * the prober reached, or one that was seen playing. Assumes {@link #applyOrder(Channel)} has
+     * already run, so the best source is first.
+     *
+     * @return true when the channel's first source is one we have reason to trust
+     */
+    public static boolean hasKnownWorkingSource(Channel channel) {
+        if (channel == null || channel.urlCount() == 0) {
+            return false;
+        }
+        // applyOrder puts the last-good source first, then the fastest measured ones, then the
+        // unknown; so a first entry that is neither unusable nor unknown is a real measurement.
+        String first = channel.url();
+        return SourceSpeedStore.rememberedLatency(first) != null;
+    }
+
     /** Stops any in-flight background probe. */
     public static void cancelBackground() {
         synchronized (sBulkLock) {
